@@ -85,18 +85,19 @@ def save_to_gsheet(price_date, data):
         df_new = df_new.dropna(subset=["날짜"])
 
         ws = get_gsheet()
-
-        # 시트가 비어있으면 헤더 먼저 작성
-        existing_data = ws.get_all_records()
         cols = ["날짜", "품목", "전월평균", "전주평균", "전일Official",
                 "전일Closing", "당일Official", "당일Closing", "전일대비"]
 
+        # 시트가 비어있으면 헤더 먼저 작성
+        existing_data = ws.get_all_records()
         if not existing_data:
             ws.append_row(cols)
+            time.sleep(1)
 
-        # 새 행 추가
+        # ✅ 핵심 수정 — 행 하나씩이 아니라 한 번에 batch로 저장
+        batch_rows = []
         for _, row in df_new.iterrows():
-            row_data = [
+            batch_rows.append([
                 row["날짜"].strftime("%Y-%m-%d"),
                 str(row.get("품목", "")),
                 _safe_val(row.get("전월평균")),
@@ -106,13 +107,30 @@ def save_to_gsheet(price_date, data):
                 _safe_val(row.get("당일Official")),
                 _safe_val(row.get("당일Closing")),
                 _safe_val(row.get("전일대비")),
-            ]
-            ws.append_row(row_data)
-            time.sleep(0.1)  # API 호출 제한 방지
+            ])
 
-        # 전체 다시 로드해서 반환
+        # ✅ append_rows로 한 번에 전송 (API 호출 1회)
+        if batch_rows:
+            ws.append_rows(batch_rows, value_input_option="USER_ENTERED")
+            time.sleep(1)  # 안전 대기
+
         return load_gsheet()
 
+    except gspread.exceptions.APIError as e:
+        if "429" in str(e):
+            st.warning("⏳ API 요청 한도 초과 — 60초 후 재시도합니다...")
+            time.sleep(60)
+            # 재시도
+            try:
+                if batch_rows:
+                    ws.append_rows(batch_rows, value_input_option="USER_ENTERED")
+                return load_gsheet()
+            except Exception as e2:
+                st.error(f"재시도 실패: {e2}")
+                return df_existing
+        else:
+            st.error(f"Google Sheets 저장 오류: {e}")
+            return df_existing
     except Exception as e:
         st.error(f"Google Sheets 저장 오류: {e}")
         return df_existing if not df_existing.empty else pd.DataFrame()
@@ -559,4 +577,5 @@ with tab3:
     )
 
 st.divider()
+
 st.caption("📌 CASH 기준 LME 가격 / 조달청 비축물자 사이트 자동 수집 / 비상업적 참고용")
