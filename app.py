@@ -1,3 +1,11 @@
+from datetime import datetime, timezone, timedelta
+
+# 한국 시간대 설정
+KST = timezone(timedelta(hours=9))
+
+def now_kst():
+    return datetime.now(KST)
+
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
@@ -320,7 +328,7 @@ def generate_comment(stats_df):
     if stats_df.empty:
         return "데이터 없음"
 
-    today_str = datetime.now().strftime("%Y년 %m월 %d일")
+    today_str = now_kst().strftime("%Y년 %m월 %d일")
     lines = [f"**📋 {today_str} 비철금속 시황 요약**\n"]
     up_items, dn_items, flat_items, big_movers = [], [], [], []
 
@@ -390,7 +398,7 @@ with col_btn:
 with col_upd:
     bulk = st.button("📥 과거 데이터 수집(30일)", use_container_width=True)
 with col_info:
-    st.info(f"실행 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    st.info(f"실행 시각: {now_kst().strftime('%Y-%m-%d %H:%M:%S')} (KST)")
 
 # ── 데이터 수집 ───────────────────────────────────────────
 if refresh or bulk:
@@ -572,10 +580,11 @@ with tab3:
     st.download_button(
         label="⬇️ CSV 다운로드",
         data=csv_export.to_csv(index=False).encode("utf-8-sig"),
-        file_name=f"metal_prices_{datetime.now().strftime('%Y%m%d')}.csv",
+        file_name=f"metal_prices_{now_kst().strftime('%Y%m%d')}.csv",
         mime="text/csv"
     )
 
 st.divider()
 
 st.caption("📌 CASH 기준 LME 가격 / 조달청 비축물자 사이트 자동 수집 / 비상업적 참고용")
+
