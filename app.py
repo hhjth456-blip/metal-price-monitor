@@ -575,28 +575,40 @@ with tab1:
         hide_index=True
     )
 
-    fx_row = stats_df[stats_df["품목"] == "환율"]
-    if not fx_row.empty:
-        st.divider()
-        fx = fx_row.iloc[0]
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric(
-            "💱 환율 (KRW/USD, 하나은행 최초고시 송금보낼때)",
-            f"{float(fx['최신가']):,.2f}" if pd.notna(fx['최신가']) else "-",
-            delta=f"{float(fx['전일대비(%)']):+.2f}%" if pd.notna(fx['전일대비(%)']) else None
-        )
-        c2.metric(
-            "당월 누적 평균",
-            f"{float(fx['당월누적평균']):,.2f}" if pd.notna(fx['당월누적평균']) else "-"
-        )
-        c3.metric(
-            "전월 평균",
-            f"{float(fx['전월평균']):,.2f}" if pd.notna(fx['전월평균']) else "-"
-        )
-        c4.metric(
-            "전월대비 변동",
-            f"{float(fx['전월대비변동(%)']):+.2f}%" if pd.notna(fx['전월대비변동(%)']) else "-"
-        )
+    st.divider()
+st.subheader("💱 환율 (KRW/USD, 하나은행 고시 매매기준율)")
+
+hana_live = fetch_hana_usd_rate()  # 항상 실시간 크롤링
+
+if hana_live:
+    live_rate = hana_live.get("당일Closing")
+    live_chg  = hana_live.get("전일대비")
+
+    fx_row   = stats_df[stats_df["품목"] == "환율"]
+    avg_this = fx_row.iloc[0].get("당월누적평균")    if not fx_row.empty else None
+    avg_last = fx_row.iloc[0].get("전월평균")        if not fx_row.empty else None
+    mom_chg  = fx_row.iloc[0].get("전월대비변동(%)") if not fx_row.empty else None
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric(
+        "💱 환율 (실시간, 하나은행 고시 매매기준율)",
+        f"{live_rate:,.2f}" if live_rate else "-",
+        delta=f"{live_chg:+.2f}" if live_chg else None
+    )
+    c2.metric(
+        "당월 누적 평균",
+        f"{float(avg_this):,.2f}" if avg_this and pd.notna(avg_this) else "-"
+    )
+    c3.metric(
+        "전월 평균",
+        f"{float(avg_last):,.2f}" if avg_last and pd.notna(avg_last) else "-"
+    )
+    c4.metric(
+        "전월대비 변동",
+        f"{float(mom_chg):+.2f}%" if mom_chg and pd.notna(mom_chg) else "-"
+    )
+else:
+    st.warning("⚠️ 환율 실시간 조회 실패 — 네이버 금융 연결을 확인하세요.")
 
 
 # ════════════════════════════════
@@ -675,5 +687,6 @@ st.caption(
     "📌 CASH 기준 LME Official 가격 / 조달청 비축물자 자동 수집 / "
     "환율: 하나은행 최초고시 송금보낼때 / 비상업적 참고용"
 )
+
 
 
