@@ -33,8 +33,8 @@ NAVER_FX_URL = "https://finance.naver.com/marketindex/exchangeDetail.naver?marke
 def fetch_hana_usd_rate(target_date: str | None = None) -> dict | None:
     """
     네이버 금융에서 하나은행 고시 USD/KRW 매매기준율을 가져온다.
-    - 출처: 네이버 금융 (하나은행 고시 기준)
-    - target_date 는 인터페이스 호환용으로 유지 (현재가만 제공)
+    숫자가 자릿수별 span으로 분리되어 있으므로 p.no_today 안의
+    span 텍스트를 모두 이어붙여 파싱한다.
     """
     headers = {
         "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -51,42 +51,50 @@ def fetch_hana_usd_rate(target_date: str | None = None) -> dict | None:
 
     soup = BeautifulSoup(res.text, "html.parser")
 
-    # ── 현재 환율 ──
-    # <strong class="num"> 또는 <span class="value"> 에서 추출
-    rate = None
-
-    # 방법1: class="num" strong 태그
-    tag = soup.find("strong", class_="num")
-    if tag:
+    def _parse_split_number(container_tag):
+        """
+        <span class="no1">1</span><span class="shim">,</span>... 형태에서
+        숫자와 소수점만 이어붙여 float 반환
+        """
+        if container_tag is None:
+            return None
+        parts = []
+        for span in container_tag.find_all("span"):
+            t = span.get_text(strip=True)
+            # 숫자와 소수점(.)만 수집, 쉼표/공백 제외
+            if re.fullmatch(r'[\d.]+', t):
+                parts.append(t)
         try:
-            rate = float(tag.get_text(strip=True).replace(",", ""))
+            return float("".join(parts)) if parts else None
         except Exception:
-            pass
+            return None
 
-    # 방법2: 정규식으로 텍스트 직접 추출
-    if not rate:
-        m = re.search(r'([\d,]+\.\d+)\s*원', res.text)
-        if m:
-            try:
-                rate = float(m.group(1).replace(",", ""))
-            except Exception:
-                pass
+    # ── 현재 환율: p.no_today 안의 첫 번째 em.no_up (또는 no_down) ──
+    rate = None
+    no_today = soup.find("p", class_="no_today")
+    if no_today:
+        inner_em = no_today.find("em")          # 바깥 em
+        if inner_em:
+            inner_em2 = inner_em.find("em")     # 안쪽 em (실제 숫자)
+            rate = _parse_split_number(inner_em2 or inner_em)
+
+    # ── 전일대비: p.no_exday 안의 em ──
+    chg = None
+    no_exday = soup.find("p", class_="no_exday")
+    if no_exday:
+        chg_em = no_exday.find("em")
+        chg = _parse_split_number(chg_em)
+        # 방향 확인 (하락이면 음수로)
+        ico = no_exday.find("span", class_="ico")
+        if ico and "down" in ico.get("class", []):
+            if chg is not None:
+                chg = -abs(chg)
 
     if not rate or rate < 100:
-        st.warning(f"네이버 환율 파싱 실패 (target_date={target_date})")
+        st.warning(f"네이버 환율 파싱 실패 (rate={rate})")
         with st.expander("🔍 네이버 환율 파싱 실패 디버그"):
             st.code(res.text[:2000], language="html")
         return None
-
-    # ── 전일대비 ──
-    chg = None
-    tag_chg = soup.find("span", class_="change")
-    if tag_chg:
-        try:
-            chg_text = tag_chg.get_text(strip=True).replace(",", "")
-            chg = float(chg_text)
-        except Exception:
-            pass
 
     return {
         "당일Official": None,
@@ -667,4 +675,5 @@ st.caption(
     "📌 CASH 기준 LME Official 가격 / 조달청 비축물자 자동 수집 / "
     "환율: 하나은행 최초고시 송금보낼때 / 비상업적 참고용"
 )
+
 
