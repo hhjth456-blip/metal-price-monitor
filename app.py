@@ -24,77 +24,75 @@ HANA_URL = "https://www.kebhana.com/cms/rate/wpfxd651_01i_01.do"
 # ──────────────────────────────────────────────────────────
 #  하나은행 환율 크롤링 (최초 고시 / 송금 보낼 때)
 # ──────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
+#  ★ 네이버 금융 → 하나은행 고시 USD/KRW 매매기준율
+#    (인증 불필요 GET 방식, 안정적)
+# ──────────────────────────────────────────────────────────
+NAVER_FX_URL = "https://finance.naver.com/marketindex/exchangeDetail.naver?marketindexCd=FX_USDKRW"
+
 def fetch_hana_usd_rate(target_date: str | None = None) -> dict | None:
-    if target_date is None:
-        target_date = datetime.now().strftime("%Y-%m-%d")
-
-    inq_date = target_date.replace("-", "")
-
-    payload = {
-        "ajax":          "true",
-        "tmpInpStrDt":   target_date,
-        "pbldDvCd":      "1",
-        "inqStrDt":      inq_date,
-        "inqKindCd":     "1",
-        "requestTarget": "searchContentDiv",
-    }
+    """
+    네이버 금융에서 하나은행 고시 USD/KRW 매매기준율을 가져온다.
+    - 출처: 네이버 금융 (하나은행 고시 기준)
+    - target_date 는 인터페이스 호환용으로 유지 (현재가만 제공)
+    """
     headers = {
-        "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer":      "https://www.kebhana.com/cont/mall/mall15/mall1501/index.jsp",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "Accept":       "text/html,application/xhtml+xml,*/*",
+        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept-Language": "ko-KR,ko;q=0.9",
+        "Referer":         "https://finance.naver.com/",
     }
 
     try:
-        res = requests.post(HANA_URL, data=payload, headers=headers, timeout=10)
+        res = requests.get(NAVER_FX_URL, headers=headers, timeout=10)
         res.raise_for_status()
     except Exception as e:
-        st.warning(f"하나은행 환율 요청 실패 ({target_date}): {e}")
+        st.warning(f"네이버 환율 요청 실패: {e}")
         return None
 
     soup = BeautifulSoup(res.text, "html.parser")
 
-    # 셀렉터 단계적으로 시도
-    candidates = (
-        soup.select("div.printdiv tbody tr")
-        or soup.select("tbody tr")
-        or soup.select("table tr")
-    )
+    # ── 현재 환율 ──
+    # <strong class="num"> 또는 <span class="value"> 에서 추출
+    rate = None
 
-    def _f(td):
+    # 방법1: class="num" strong 태그
+    tag = soup.find("strong", class_="num")
+    if tag:
         try:
-            return float(td.get_text(strip=True).replace(",", ""))
+            rate = float(tag.get_text(strip=True).replace(",", ""))
         except Exception:
-            return None
+            pass
 
-    for tr in candidates:
-        tds = tr.find_all("td")
-        if not tds:
-            continue
-        first_text = tds[0].get_text(strip=True)
-        if "USD" not in first_text and "미국" not in first_text:
-            continue
-        if len(tds) < 6:
-            continue
+    # 방법2: 정규식으로 텍스트 직접 추출
+    if not rate:
+        m = re.search(r'([\d,]+\.\d+)\s*원', res.text)
+        if m:
+            try:
+                rate = float(m.group(1).replace(",", ""))
+            except Exception:
+                pass
 
-        # 0:통화 / 1:현찰살때 / 2:- / 3:현찰팔때 / 4:- /
-        # 5:송금보낼때 / 6:송금받을때 / 7:T/C살때 /
-        # 8:외화수표팔때 / 9:매매기준율 / 10:환가료율 / 11:미화환산율
-        remittance_sell = _f(tds[5])
+    if not rate or rate < 100:
+        st.warning(f"네이버 환율 파싱 실패 (target_date={target_date})")
+        with st.expander("🔍 네이버 환율 파싱 실패 디버그"):
+            st.code(res.text[:2000], language="html")
+        return None
 
-        if remittance_sell and remittance_sell > 100:
-            return {
-                "당일Official": None,
-                "당일Closing":  remittance_sell,
-                "전일대비":     None,
-            }
+    # ── 전일대비 ──
+    chg = None
+    tag_chg = soup.find("span", class_="change")
+    if tag_chg:
+        try:
+            chg_text = tag_chg.get_text(strip=True).replace(",", "")
+            chg = float(chg_text)
+        except Exception:
+            pass
 
-    # 파싱 실패 시 디버그 HTML 출력
-    with st.expander(f"🔍 하나은행 파싱 실패 디버그 ({target_date})"):
-        st.code(res.text[:3000], language="html")
-
-    return None
-
+    return {
+        "당일Official": None,
+        "당일Closing":  rate,   # 하나은행 고시 매매기준율
+        "전일대비":     chg,
+    }
 
 # ── Google Sheets 연결 ────────────────────────────────────
 @st.cache_resource
@@ -669,3 +667,4 @@ st.caption(
     "📌 CASH 기준 LME Official 가격 / 조달청 비축물자 자동 수집 / "
     "환율: 하나은행 최초고시 송금보낼때 / 비상업적 참고용"
 )
+
