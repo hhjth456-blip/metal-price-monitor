@@ -1,11 +1,3 @@
-from datetime import datetime, timezone, timedelta
-
-# 한국 시간대 설정
-KST = timezone(timedelta(hours=9))
-
-def now_kst():
-    return datetime.now(KST)
-
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
@@ -26,6 +18,89 @@ BASE_URL = "https://www.pps.go.kr/bichuk/bbs"
 LIST_URL = f"{BASE_URL}/list.do"
 VIEW_URL = f"{BASE_URL}/view.do"
 METALS   = ["알루미늄", "납", "아연", "구리", "주석", "니켈"]
+HANA_URL = "https://www.kebhana.com/cms/rate/wpfxd651_01i_01.do"
+
+
+# ──────────────────────────────────────────────────────────
+#  ★ 하나은행 환율 크롤링 (최초 고시 / 송금 보낼 때)
+# ──────────────────────────────────────────────────────────
+def fetch_hana_usd_rate(target_date: str | None = None) -> dict | None:
+    """
+    하나은행 고시환율 POST API에서 USD 송금보낼때 환율(최초 고시)을 가져온다.
+
+    Parameters
+    ----------
+    target_date : str | None
+        "YYYY-MM-DD" 형식. None이면 오늘 날짜 사용.
+
+    Returns
+    -------
+    dict | None
+        {
+            "당일Official": None,
+            "당일Closing" : 송금보낼때 환율,   # index 5
+            "전일대비"    : None,
+        }
+        실패 시 None 반환
+    """
+    if target_date is None:
+        target_date = datetime.now().strftime("%Y-%m-%d")
+
+    inq_date = target_date.replace("-", "")
+
+    payload = {
+        "ajax":          "true",
+        "tmpInpStrDt":   target_date,
+        "pbldDvCd":      "1",           # 1 = 최초 고시
+        "inqStrDt":      inq_date,
+        "inqKindCd":     "1",
+        "requestTarget": "searchContentDiv",
+    }
+    headers = {
+        "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer":      "https://www.kebhana.com/cont/mall/mall15/mall1501/index.jsp",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Accept":       "text/html,application/xhtml+xml,*/*",
+    }
+
+    try:
+        res = requests.post(HANA_URL, data=payload, headers=headers, timeout=10)
+        res.raise_for_status()
+    except Exception as e:
+        st.warning(f"하나은행 환율 요청 실패: {e}")
+        return None
+
+    soup = BeautifulSoup(res.text, "html.parser")
+
+    for tr in soup.select("div.printdiv tbody tr, tbody tr"):
+        tds = tr.find_all("td")
+        if not tds:
+            continue
+        if "USD" not in tds[0].get_text(strip=True):
+            continue
+
+        def _f(td):
+            try:
+                return float(td.get_text(strip=True).replace(",", ""))
+            except Exception:
+                return None
+
+        # 컬럼 순서:
+        # 0:통화 / 1:현찰살때 / 2:- / 3:현찰팔때 / 4:- /
+        # 5:송금보낼때 / 6:송금받을때 / 7:T/C살때 /
+        # 8:외화수표팔때 / 9:매매기준율 / 10:환가료율 / 11:미화환산율
+        remittance_sell = _f(tds[5]) if len(tds) > 5 else None
+
+        if remittance_sell:
+            return {
+                "당일Official": None,
+                "당일Closing":  remittance_sell,  # 송금 보낼 때
+                "전일대비":     None,
+            }
+
+    st.warning(f"하나은행 USD 행을 찾지 못했습니다. (날짜: {target_date})")
+    return None
+
 
 # ── Google Sheets 연결 ────────────────────────────────────
 @st.cache_resource
@@ -39,7 +114,7 @@ def get_gsheet():
         scopes=scopes
     )
     client = gspread.authorize(creds)
-    sheet = client.open_by_key(st.secrets["sheets"]["spreadsheet_id"])
+    sheet  = client.open_by_key(st.secrets["sheets"]["spreadsheet_id"])
     try:
         ws = sheet.worksheet(st.secrets["sheets"]["worksheet_name"])
     except gspread.WorksheetNotFound:
@@ -49,16 +124,16 @@ def get_gsheet():
         )
     return ws
 
+
 def load_gsheet():
     try:
-        ws = get_gsheet()
+        ws   = get_gsheet()
         data = ws.get_all_records()
         if not data:
             return pd.DataFrame()
         df = pd.DataFrame(data)
         df["날짜"] = pd.to_datetime(df["날짜"], errors="coerce")
         df = df.dropna(subset=["날짜"])
-        # 숫자 컬럼 변환
         for col in ["전월평균", "전주평균", "전일Official", "전일Closing",
                     "당일Official", "당일Closing", "전일대비"]:
             if col in df.columns:
@@ -68,17 +143,16 @@ def load_gsheet():
         st.error(f"Google Sheets 로드 오류: {e}")
         return pd.DataFrame()
 
+
 def save_to_gsheet(price_date, data):
     try:
         df_existing = load_gsheet()
 
-        # 중복 날짜 체크
         if not df_existing.empty:
             existing_dates = df_existing["날짜"].dt.strftime("%Y%m%d").tolist()
             if price_date in existing_dates:
                 return df_existing
 
-        # 새 데이터 행 구성
         new_rows = []
         for item, vals in data.items():
             row = {"날짜": price_date, "품목": item}
@@ -92,20 +166,16 @@ def save_to_gsheet(price_date, data):
         df_new["날짜"] = pd.to_datetime(df_new["날짜"], format="%Y%m%d", errors="coerce")
         df_new = df_new.dropna(subset=["날짜"])
 
-        ws = get_gsheet()
+        ws            = get_gsheet()
+        existing_data = ws.get_all_records()
         cols = ["날짜", "품목", "전월평균", "전주평균", "전일Official",
                 "전일Closing", "당일Official", "당일Closing", "전일대비"]
 
-        # 시트가 비어있으면 헤더 먼저 작성
-        existing_data = ws.get_all_records()
         if not existing_data:
             ws.append_row(cols)
-            time.sleep(1)
 
-        # ✅ 핵심 수정 — 행 하나씩이 아니라 한 번에 batch로 저장
-        batch_rows = []
         for _, row in df_new.iterrows():
-            batch_rows.append([
+            row_data = [
                 row["날짜"].strftime("%Y-%m-%d"),
                 str(row.get("품목", "")),
                 _safe_val(row.get("전월평균")),
@@ -115,57 +185,41 @@ def save_to_gsheet(price_date, data):
                 _safe_val(row.get("당일Official")),
                 _safe_val(row.get("당일Closing")),
                 _safe_val(row.get("전일대비")),
-            ])
-
-        # ✅ append_rows로 한 번에 전송 (API 호출 1회)
-        if batch_rows:
-            ws.append_rows(batch_rows, value_input_option="USER_ENTERED")
-            time.sleep(1)  # 안전 대기
+            ]
+            ws.append_row(row_data)
+            time.sleep(0.1)
 
         return load_gsheet()
 
-    except gspread.exceptions.APIError as e:
-        if "429" in str(e):
-            st.warning("⏳ API 요청 한도 초과 — 60초 후 재시도합니다...")
-            time.sleep(60)
-            # 재시도
-            try:
-                if batch_rows:
-                    ws.append_rows(batch_rows, value_input_option="USER_ENTERED")
-                return load_gsheet()
-            except Exception as e2:
-                st.error(f"재시도 실패: {e2}")
-                return df_existing
-        else:
-            st.error(f"Google Sheets 저장 오류: {e}")
-            return df_existing
     except Exception as e:
         st.error(f"Google Sheets 저장 오류: {e}")
         return df_existing if not df_existing.empty else pd.DataFrame()
 
+
 def _safe_val(v):
-    """None/NaN → 빈 문자열로 변환 (Sheets 저장용)"""
     if v is None:
         return ""
     if isinstance(v, float) and pd.isna(v):
         return ""
     return v
 
+
 # ── 세션 ────────────────────────────────────────────────
 def get_session():
     s = requests.Session()
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "ko-KR,ko;q=0.9",
-        "Connection": "keep-alive",
+        "Connection":      "keep-alive",
     })
     try:
         s.get("https://www.pps.go.kr/bichuk/index.do", timeout=10)
         time.sleep(1)
-    except:
+    except Exception:
         pass
     return s
+
 
 # ── 목록 크롤링 ──────────────────────────────────────────
 def crawl_list(session, pages=1):
@@ -184,10 +238,11 @@ def crawl_list(session, pages=1):
                     m = re.search(r"fn_view\('(\w+)'", onclick)
                 if m:
                     items.append(m.group(1))
-        except:
+        except Exception:
             pass
         time.sleep(0.5)
     return items
+
 
 # ── 상세 크롤링 ──────────────────────────────────────────
 def crawl_detail(session, bbs_sn):
@@ -198,7 +253,7 @@ def crawl_detail(session, bbs_sn):
             "sc": "", "sw": ""
         }, timeout=15)
         res.raise_for_status()
-    except Exception as e:
+    except Exception:
         return None
 
     soup = BeautifulSoup(res.text, "html.parser")
@@ -234,14 +289,15 @@ def crawl_detail(session, bbs_sn):
     def safe_float(v):
         try:
             return float(str(v).replace(",", ""))
-        except:
+        except Exception:
             return None
 
-    rows = {}
+    rows         = {}
     current_item = ""
+
     for tr in tbody.find_all("tr"):
-        th = tr.find("th")
-        tds = tr.find_all("td")
+        th   = tr.find("th")
+        tds  = tr.find_all("td")
         if th:
             current_item = th.get_text(strip=True)
         cells = [td.get_text(strip=True) for td in tds]
@@ -260,18 +316,27 @@ def crawl_detail(session, bbs_sn):
                     "당일Closing":  safe_float(cells[6]) if len(cells) > 6 else None,
                     "전일대비":     safe_float(cells[7]) if len(cells) > 7 else None,
                 }
-        elif current_item == "환율":
-            rows["환율"] = {
-                "전월평균":     safe_float(cells[1]) if len(cells) > 1 else None,
-                "전주평균":     safe_float(cells[2]) if len(cells) > 2 else None,
-                "전일Official": None,
-                "전일Closing":  safe_float(cells[3]) if len(cells) > 3 else None,
-                "당일Official": None,
-                "당일Closing":  safe_float(cells[4]) if len(cells) > 4 else None,
-                "전일대비":     safe_float(cells[5]) if len(cells) > 5 else None,
-            }
+
+    # ── ★ 환율: 하나은행 최초 고시 송금보낼때로 교체 ──
+    if price_date and len(price_date) == 8:
+        hana_date = f"{price_date[:4]}-{price_date[4:6]}-{price_date[6:]}"
+    else:
+        hana_date = None
+
+    hana = fetch_hana_usd_rate(hana_date)
+    if hana:
+        rows["환율"] = {
+            "전월평균":     None,
+            "전주평균":     None,
+            "전일Official": None,
+            "전일Closing":  None,
+            "당일Official": None,
+            "당일Closing":  hana.get("당일Closing"),   # 송금 보낼 때
+            "전일대비":     None,
+        }
 
     return {"price_date": price_date, "data": rows}
+
 
 # ── 통계 계산 ─────────────────────────────────────────────
 def calc_stats(df):
@@ -288,18 +353,21 @@ def calc_stats(df):
         if sub.empty:
             continue
 
+        # 비철금속 → 당일Official / 환율 → 당일Closing(송금보낼때)
+        price_col = "당일Official" if item in METALS else "당일Closing"
+
         sub["월"] = sub["날짜"].dt.to_period("M")
-        this_m = sub[sub["월"] == this_month]["당일Closing"].dropna()
-        last_m = sub[sub["월"] == last_month]["당일Closing"].dropna()
+        this_m   = sub[sub["월"] == this_month][price_col].dropna()
+        last_m   = sub[sub["월"] == last_month][price_col].dropna()
 
         avg_this = round(this_m.mean(), 2) if not this_m.empty else None
         avg_last = round(last_m.mean(), 2) if not last_m.empty else None
         chg_pct  = None
-        # ✅ 0.0 falsy 버그 수정 — is not None 명시 체크
         if avg_this is not None and avg_last is not None and avg_last != 0:
             chg_pct = round((avg_this - avg_last) / avg_last * 100, 2)
 
-        latest  = sub.sort_values("날짜").iloc[-1]
+        latest       = sub.sort_values("날짜").iloc[-1]
+        latest_price = latest.get(price_col)
 
         chg_val = latest.get("전일대비")
         if chg_val is None or (isinstance(chg_val, float) and pd.isna(chg_val)):
@@ -309,7 +377,8 @@ def calc_stats(df):
 
         results.append({
             "품목":            item,
-            "최신가(Closing)": latest.get("당일Closing"),
+            "최신가":          latest_price,
+            "가격기준":        "Official" if item in METALS else "송금보낼때",
             "전일대비(%)":     chg_val,
             "당월누적평균":    avg_this,
             "전월평균":        avg_last,
@@ -318,18 +387,19 @@ def calc_stats(df):
         })
 
     result_df = pd.DataFrame(results)
-    for col in ["최신가(Closing)", "전일대비(%)", "당월누적평균", "전월평균", "전월대비변동(%)"]:
+    for col in ["최신가", "전일대비(%)", "당월누적평균", "전월평균", "전월대비변동(%)"]:
         if col in result_df.columns:
             result_df[col] = pd.to_numeric(result_df[col], errors="coerce")
     return result_df
+
 
 # ── AI 룰베이스 코멘트 ────────────────────────────────────
 def generate_comment(stats_df):
     if stats_df.empty:
         return "데이터 없음"
 
-    today_str = now_kst().strftime("%Y년 %m월 %d일")
-    lines = [f"**📋 {today_str} 비철금속 시황 요약**\n"]
+    today_str = datetime.now().strftime("%Y년 %m월 %d일")
+    lines     = [f"**📋 {today_str} 비철금속 시황 요약**\n"]
     up_items, dn_items, flat_items, big_movers = [], [], [], []
 
     for _, row in stats_df.iterrows():
@@ -364,15 +434,19 @@ def generate_comment(stats_df):
     fx_row = stats_df[stats_df["품목"] == "환율"]
     if not fx_row.empty:
         fx      = fx_row.iloc[0]
-        fx_val  = fx.get("최신가(Closing)")
+        fx_val  = fx.get("최신가")
         fx_chg  = fx.get("전일대비(%)")
         fx_mom  = fx.get("전월대비변동(%)")
-        fx_str  = f"{float(fx_val):,.2f}" if pd.notna(fx_val) and fx_val is not None else "-"
+        fx_str  = f"{float(fx_val):,.2f}"  if pd.notna(fx_val)  and fx_val  is not None else "-"
         chg_str = f"{float(fx_chg):+.2f}%" if pd.notna(fx_chg) and fx_chg is not None else "-"
         mom_str = f"{float(fx_mom):+.2f}%" if pd.notna(fx_mom) and fx_mom is not None else "-"
-        lines.append(f"\n💱 **환율(KRW/USD):** {fx_str} (전일대비 {chg_str} / 전월대비 {mom_str})")
+        lines.append(
+            f"\n💱 **환율(KRW/USD, 하나은행 최초고시 송금보낼때):** "
+            f"{fx_str} (전일대비 {chg_str} / 전월대비 {mom_str})"
+        )
 
     return "\n\n".join(lines)
+
 
 # ── 색상 스타일 ───────────────────────────────────────────
 def color_val(val):
@@ -383,14 +457,18 @@ def color_val(val):
         if v > 0:   return "color:#e74c3c; font-weight:bold"
         elif v < 0: return "color:#2980b9; font-weight:bold"
         return "color:gray"
-    except:
+    except Exception:
         return ""
+
 
 # ══════════════════════════════════════════════════════════
 #  UI
 # ══════════════════════════════════════════════════════════
 st.title("📊 조달청 비철금속 국제가격 모니터")
-st.caption("출처: 조달청 비축물자 사이트 (pps.go.kr) · CASH 기준 · 매일 자동 누적")
+st.caption(
+    "출처: 조달청 비축물자 (pps.go.kr) · **비철금속 Official 기준** · "
+    "환율: **하나은행 최초고시 송금보낼때** · 매일 자동 누적"
+)
 
 col_btn, col_upd, col_info = st.columns([1, 1, 4])
 with col_btn:
@@ -398,7 +476,8 @@ with col_btn:
 with col_upd:
     bulk = st.button("📥 과거 데이터 수집(30일)", use_container_width=True)
 with col_info:
-    st.info(f"실행 시각: {now_kst().strftime('%Y-%m-%d %H:%M:%S')} (KST)")
+    st.info(f"실행 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
 
 # ── 데이터 수집 ───────────────────────────────────────────
 if refresh or bulk:
@@ -433,6 +512,7 @@ if refresh or bulk:
             st.text(log)
     st.cache_data.clear()
 
+
 # ── Sheets 로드 ───────────────────────────────────────────
 df_all = load_gsheet()
 
@@ -442,8 +522,10 @@ if df_all.empty:
 
 stats_df = calc_stats(df_all)
 
+
 # ── 탭 구성 ───────────────────────────────────────────────
 tab1, tab2, tab3 = st.tabs(["📌 오늘 시황", "📈 추이 차트", "📊 통계 분석"])
+
 
 # ════════════════════════════════
 # TAB 1 : 오늘 시황
@@ -452,11 +534,11 @@ with tab1:
     st.markdown(generate_comment(stats_df))
     st.divider()
 
-    st.subheader("💡 당일 Closing (CASH, USD/ton)")
+    st.subheader("💡 당일 Official (CASH, USD/ton)")
     metal_stats = stats_df[stats_df["품목"].isin(METALS)]
     cols = st.columns(len(METALS))
     for i, (_, row) in enumerate(metal_stats.iterrows()):
-        price = row.get("최신가(Closing)")
+        price = row.get("최신가")
         chg   = row.get("전일대비(%)")
         try:
             if chg is not None and pd.notna(chg):
@@ -464,7 +546,7 @@ with tab1:
                 delta_color = "normal"
             else:
                 delta_str, delta_color = "-", "off"
-        except:
+        except Exception:
             delta_str, delta_color = "-", "off"
         cols[i].metric(
             label=row["품목"],
@@ -475,13 +557,14 @@ with tab1:
 
     st.divider()
     st.subheader("📋 전월대비 분석 테이블")
-    display_cols = ["품목", "최신가(Closing)", "전일대비(%)", "당월누적평균", "전월평균", "전월대비변동(%)", "기준일"]
+    display_cols = ["품목", "최신가", "가격기준", "전일대비(%)",
+                    "당월누적평균", "전월평균", "전월대비변동(%)", "기준일"]
     st.dataframe(
         stats_df[display_cols].style
         .applymap(color_val, subset=["전일대비(%)", "전월대비변동(%)"])
         .format(
             {
-                "최신가(Closing)": "{:,.2f}",
+                "최신가":          "{:,.2f}",
                 "전일대비(%)":     "{:+.2f}%",
                 "당월누적평균":    "{:,.2f}",
                 "전월평균":        "{:,.2f}",
@@ -499,8 +582,8 @@ with tab1:
         fx = fx_row.iloc[0]
         c1, c2, c3, c4 = st.columns(4)
         c1.metric(
-            "💱 환율 (KRW/USD)",
-            f"{float(fx['최신가(Closing)']):,.2f}" if pd.notna(fx['최신가(Closing)']) else "-",
+            "💱 환율 (KRW/USD, 하나은행 최초고시 송금보낼때)",
+            f"{float(fx['최신가']):,.2f}" if pd.notna(fx['최신가']) else "-",
             delta=f"{float(fx['전일대비(%)']):+.2f}%" if pd.notna(fx['전일대비(%)']) else None
         )
         c2.metric(
@@ -516,35 +599,37 @@ with tab1:
             f"{float(fx['전월대비변동(%)']):+.2f}%" if pd.notna(fx['전월대비변동(%)']) else "-"
         )
 
+
 # ════════════════════════════════
 # TAB 2 : 추이 차트
 # ════════════════════════════════
 with tab2:
-    st.subheader("📈 품목별 Closing 가격 추이")
+    st.subheader("📈 품목별 Official 가격 추이 (CASH, USD/ton)")
 
     selected = st.multiselect("품목 선택", options=METALS, default=["구리", "알루미늄", "니켈"])
     period   = st.radio("기간", ["1개월", "3개월", "전체"], horizontal=True)
 
-    today = df_all["날짜"].max()
+    today_dt = df_all["날짜"].max()
 
     if selected:
         df_chart = df_all[df_all["품목"].isin(selected)].copy()
         if period == "1개월":
-            df_chart = df_chart[df_chart["날짜"] >= today - pd.Timedelta(days=30)]
+            df_chart = df_chart[df_chart["날짜"] >= today_dt - pd.Timedelta(days=30)]
         elif period == "3개월":
-            df_chart = df_chart[df_chart["날짜"] >= today - pd.Timedelta(days=90)]
-        pivot = df_chart.pivot_table(index="날짜", columns="품목", values="당일Closing")
+            df_chart = df_chart[df_chart["날짜"] >= today_dt - pd.Timedelta(days=90)]
+        pivot = df_chart.pivot_table(index="날짜", columns="품목", values="당일Official")
         st.line_chart(pivot, use_container_width=True)
 
     st.divider()
-    st.subheader("💱 환율 추이 (KRW/USD)")
+    st.subheader("💱 환율 추이 (KRW/USD, 하나은행 최초고시 송금보낼때)")
     df_fx = df_all[df_all["품목"] == "환율"].set_index("날짜")[["당일Closing"]].copy()
     df_fx.columns = ["환율(KRW/USD)"]
     if period == "1개월":
-        df_fx = df_fx[df_fx.index >= today - pd.Timedelta(days=30)]
+        df_fx = df_fx[df_fx.index >= today_dt - pd.Timedelta(days=30)]
     elif period == "3개월":
-        df_fx = df_fx[df_fx.index >= today - pd.Timedelta(days=90)]
+        df_fx = df_fx[df_fx.index >= today_dt - pd.Timedelta(days=90)]
     st.line_chart(df_fx, use_container_width=True)
+
 
 # ════════════════════════════════
 # TAB 3 : 통계 분석
@@ -556,17 +641,20 @@ with tab3:
     df_item  = df_all[df_all["품목"] == item_sel].copy()
     df_item["월"] = df_item["날짜"].dt.to_period("M").astype(str)
 
-    monthly = df_item.groupby("월")["당일Closing"].mean().reset_index()
-    monthly.columns = ["월", "월평균 Closing"]
-    monthly["월평균 Closing"] = monthly["월평균 Closing"].round(2)
-    monthly["전월대비(%)"] = monthly["월평균 Closing"].pct_change().mul(100).round(2)
+    # 비철금속 → Official / 환율 → Closing(송금보낼때)
+    val_col  = "당일Official" if item_sel in METALS else "당일Closing"
+    label    = "Official" if item_sel in METALS else "송금보낼때"
+    monthly  = df_item.groupby("월")[val_col].mean().reset_index()
+    monthly.columns = ["월", f"월평균({label})"]
+    monthly[f"월평균({label})"] = monthly[f"월평균({label})"].round(2)
+    monthly["전월대비(%)"] = monthly[f"월평균({label})"].pct_change().mul(100).round(2)
 
-    st.bar_chart(monthly.set_index("월")["월평균 Closing"], use_container_width=True)
+    st.bar_chart(monthly.set_index("월")[f"월평균({label})"], use_container_width=True)
     st.dataframe(
         monthly.style
         .applymap(color_val, subset=["전월대비(%)"])
         .format({
-            "월평균 Closing": "{:,.2f}",
+            f"월평균({label})": "{:,.2f}",
             "전월대비(%)": lambda x: f"{x:+.2f}%" if pd.notna(x) else "-"
         }),
         use_container_width=True,
@@ -575,16 +663,17 @@ with tab3:
 
     st.divider()
     st.subheader("📁 원본 데이터 다운로드")
-    csv_export = df_all.copy()
+    csv_export         = df_all.copy()
     csv_export["날짜"] = csv_export["날짜"].dt.strftime("%Y-%m-%d")
     st.download_button(
         label="⬇️ CSV 다운로드",
         data=csv_export.to_csv(index=False).encode("utf-8-sig"),
-        file_name=f"metal_prices_{now_kst().strftime('%Y%m%d')}.csv",
+        file_name=f"metal_prices_{datetime.now().strftime('%Y%m%d')}.csv",
         mime="text/csv"
     )
 
 st.divider()
-
-st.caption("📌 CASH 기준 LME 가격 / 조달청 비축물자 사이트 자동 수집 / 비상업적 참고용")
-
+st.caption(
+    "📌 CASH 기준 LME Official 가격 / 조달청 비축물자 자동 수집 / "
+    "환율: 하나은행 최초고시 송금보낼때 / 비상업적 참고용"
+)
