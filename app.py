@@ -22,27 +22,9 @@ HANA_URL = "https://www.kebhana.com/cms/rate/wpfxd651_01i_01.do"
 
 
 # ──────────────────────────────────────────────────────────
-#  ★ 하나은행 환율 크롤링 (최초 고시 / 송금 보낼 때)
+#  하나은행 환율 크롤링 (최초 고시 / 송금 보낼 때)
 # ──────────────────────────────────────────────────────────
 def fetch_hana_usd_rate(target_date: str | None = None) -> dict | None:
-    """
-    하나은행 고시환율 POST API에서 USD 송금보낼때 환율(최초 고시)을 가져온다.
-
-    Parameters
-    ----------
-    target_date : str | None
-        "YYYY-MM-DD" 형식. None이면 오늘 날짜 사용.
-
-    Returns
-    -------
-    dict | None
-        {
-            "당일Official": None,
-            "당일Closing" : 송금보낼때 환율,   # index 5
-            "전일대비"    : None,
-        }
-        실패 시 None 반환
-    """
     if target_date is None:
         target_date = datetime.now().strftime("%Y-%m-%d")
 
@@ -51,7 +33,7 @@ def fetch_hana_usd_rate(target_date: str | None = None) -> dict | None:
     payload = {
         "ajax":          "true",
         "tmpInpStrDt":   target_date,
-        "pbldDvCd":      "1",           # 1 = 최초 고시
+        "pbldDvCd":      "1",
         "inqStrDt":      inq_date,
         "inqKindCd":     "1",
         "requestTarget": "searchContentDiv",
@@ -67,38 +49,50 @@ def fetch_hana_usd_rate(target_date: str | None = None) -> dict | None:
         res = requests.post(HANA_URL, data=payload, headers=headers, timeout=10)
         res.raise_for_status()
     except Exception as e:
-        st.warning(f"하나은행 환율 요청 실패: {e}")
+        st.warning(f"하나은행 환율 요청 실패 ({target_date}): {e}")
         return None
 
     soup = BeautifulSoup(res.text, "html.parser")
 
-    for tr in soup.select("div.printdiv tbody tr, tbody tr"):
+    # 셀렉터 단계적으로 시도
+    candidates = (
+        soup.select("div.printdiv tbody tr")
+        or soup.select("tbody tr")
+        or soup.select("table tr")
+    )
+
+    def _f(td):
+        try:
+            return float(td.get_text(strip=True).replace(",", ""))
+        except Exception:
+            return None
+
+    for tr in candidates:
         tds = tr.find_all("td")
         if not tds:
             continue
-        if "USD" not in tds[0].get_text(strip=True):
+        first_text = tds[0].get_text(strip=True)
+        if "USD" not in first_text and "미국" not in first_text:
+            continue
+        if len(tds) < 6:
             continue
 
-        def _f(td):
-            try:
-                return float(td.get_text(strip=True).replace(",", ""))
-            except Exception:
-                return None
-
-        # 컬럼 순서:
         # 0:통화 / 1:현찰살때 / 2:- / 3:현찰팔때 / 4:- /
         # 5:송금보낼때 / 6:송금받을때 / 7:T/C살때 /
         # 8:외화수표팔때 / 9:매매기준율 / 10:환가료율 / 11:미화환산율
-        remittance_sell = _f(tds[5]) if len(tds) > 5 else None
+        remittance_sell = _f(tds[5])
 
-        if remittance_sell:
+        if remittance_sell and remittance_sell > 100:
             return {
                 "당일Official": None,
-                "당일Closing":  remittance_sell,  # 송금 보낼 때
+                "당일Closing":  remittance_sell,
                 "전일대비":     None,
             }
 
-    st.warning(f"하나은행 USD 행을 찾지 못했습니다. (날짜: {target_date})")
+    # 파싱 실패 시 디버그 HTML 출력
+    with st.expander(f"🔍 하나은행 파싱 실패 디버그 ({target_date})"):
+        st.code(res.text[:3000], language="html")
+
     return None
 
 
@@ -258,7 +252,7 @@ def crawl_detail(session, bbs_sn):
 
     soup = BeautifulSoup(res.text, "html.parser")
 
-    # ── 가격일자 추출 ──
+    # 가격일자 추출
     price_date = None
     for span in soup.find_all("span"):
         t = span.get_text(strip=True)
@@ -275,7 +269,7 @@ def crawl_detail(session, bbs_sn):
         if m:
             price_date = m.group(1)
 
-    # ── 가격 테이블 파싱 ──
+    # 가격 테이블 파싱
     content_div = soup.find("div", id="brdContent")
     if not content_div:
         return {"price_date": price_date, "data": {}}
@@ -317,7 +311,7 @@ def crawl_detail(session, bbs_sn):
                     "전일대비":     safe_float(cells[7]) if len(cells) > 7 else None,
                 }
 
-    # ── ★ 환율: 하나은행 최초 고시 송금보낼때로 교체 ──
+    # 환율: 하나은행 최초 고시 송금보낼때
     if price_date and len(price_date) == 8:
         hana_date = f"{price_date[:4]}-{price_date[4:6]}-{price_date[6:]}"
     else:
@@ -331,7 +325,7 @@ def crawl_detail(session, bbs_sn):
             "전일Official": None,
             "전일Closing":  None,
             "당일Official": None,
-            "당일Closing":  hana.get("당일Closing"),   # 송금 보낼 때
+            "당일Closing":  hana.get("당일Closing"),
             "전일대비":     None,
         }
 
@@ -353,7 +347,6 @@ def calc_stats(df):
         if sub.empty:
             continue
 
-        # 비철금속 → 당일Official / 환율 → 당일Closing(송금보낼때)
         price_col = "당일Official" if item in METALS else "당일Closing"
 
         sub["월"] = sub["날짜"].dt.to_period("M")
@@ -393,7 +386,7 @@ def calc_stats(df):
     return result_df
 
 
-# ── AI 룰베이스 코멘트 ────────────────────────────────────
+# ── 룰베이스 코멘트 ───────────────────────────────────────
 def generate_comment(stats_df):
     if stats_df.empty:
         return "데이터 없음"
@@ -641,7 +634,6 @@ with tab3:
     df_item  = df_all[df_all["품목"] == item_sel].copy()
     df_item["월"] = df_item["날짜"].dt.to_period("M").astype(str)
 
-    # 비철금속 → Official / 환율 → Closing(송금보낼때)
     val_col  = "당일Official" if item_sel in METALS else "당일Closing"
     label    = "Official" if item_sel in METALS else "송금보낼때"
     monthly  = df_item.groupby("월")[val_col].mean().reset_index()
