@@ -560,7 +560,7 @@ with tab1:
                     "당월누적평균", "전월평균", "전월대비변동(%)", "기준일"]
     st.dataframe(
         stats_df[display_cols].style
-        .applymap(color_val, subset=["전일대비(%)", "전월대비변동(%)"])
+        .map(color_val, subset=["전일대비(%)", "전월대비변동(%)"])
         .format(
             {
                 "최신가":          "{:,.2f}",
