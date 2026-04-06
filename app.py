@@ -662,7 +662,7 @@ with tab3:
     st.bar_chart(monthly.set_index("월")[f"월평균({label})"], use_container_width=True)
     st.dataframe(
         monthly.style
-        .applymap(color_val, subset=["전월대비(%)"])
+        .map(color_val, subset=["전월대비(%)"])
         .format({
             f"월평균({label})": "{:,.2f}",
             "전월대비(%)": lambda x: f"{x:+.2f}%" if pd.notna(x) else "-"
