@@ -7,6 +7,13 @@ import re
 import time
 import gspread
 from google.oauth2.service_account import Credentials
+import urllib3
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import socket
+
+# ★ SSL 경고 메시지 숨김
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 st.set_page_config(
     page_title="조달청 비철금속 국제가격",
@@ -43,15 +50,14 @@ def fetch_oil_prices(pages: int = 1) -> list:
         for page in range(1, pages + 1):
             url = f"{base_url}&page={page}"
             try:
-                res = requests.get(url, headers=headers, timeout=10)
+                res = requests.get(url, headers=headers, timeout=15, verify=False)
                 res.raise_for_status()
                 soup = BeautifulSoup(res.text, "html.parser")
 
-                # ★ 수정: class가 여러 개일 수 있으므로 class_ 대신 직접 탐색
                 tbl = (
                     soup.find("table", class_="tbl_exchange") or
                     soup.find("table", {"class": re.compile(r"tbl_exchange")}) or
-                    soup.find("table")   # fallback: 페이지 내 첫 번째 테이블
+                    soup.find("table")
                 )
                 if not tbl:
                     continue
@@ -61,26 +67,22 @@ def fetch_oil_prices(pages: int = 1) -> list:
                     if len(tds) < 3:
                         continue
 
-                    date_str  = tds[0].get_text(strip=True)   # 2026.04.10
-                    price_str = tds[1].get_text(strip=True)   # 96.57
-                    chg_str   = tds[2].get_text(strip=True)   # 1.30
+                    date_str  = tds[0].get_text(strip=True)
+                    price_str = tds[1].get_text(strip=True)
+                    chg_str   = tds[2].get_text(strip=True)
                     pct_str   = tds[3].get_text(strip=True) if len(tds) > 3 else ""
 
-                    # ★ 수정: CSS 클래스 기반 상승/하락 판별 (img alt 대신)
                     is_down = False
-                    # td[1] 또는 td[2] 안의 span 클래스로 판별
                     for td_check in tds[1:3]:
                         span_ico = td_check.find("span", class_=re.compile(r"blind|ico"))
                         if span_ico:
                             txt = span_ico.get_text(strip=True)
                             if "하락" in txt or "down" in txt.lower():
                                 is_down = True
-                        # 또는 부모 td/span의 class 확인
                         for tag in td_check.find_all(True):
                             cls = " ".join(tag.get("class", []))
                             if "down" in cls.lower() or "fall" in cls.lower() or "minus" in cls.lower():
                                 is_down = True
-                    # img alt 방식도 병행 유지
                     img = tds[1].find("img")
                     if img:
                         alt = img.get("alt", "")
@@ -88,7 +90,6 @@ def fetch_oil_prices(pages: int = 1) -> list:
                         if "하락" in alt or "down" in src.lower() or "fall" in src.lower():
                             is_down = True
 
-                    # ★ 수정: pct_str에서 음수 부호 확인으로 방향 2차 보정
                     try:
                         pct = float(pct_str.replace(",", "").replace("%", ""))
                         if pct < 0:
@@ -154,7 +155,7 @@ def fetch_hana_usd_rate(target_date=None) -> dict | None:
         "Referer": "https://finance.naver.com/",
     }
     try:
-        res = requests.get(NAVER_FX_URL, headers=headers, timeout=10)
+        res = requests.get(NAVER_FX_URL, headers=headers, timeout=15, verify=False)
         res.raise_for_status()
     except Exception as e:
         st.warning(f"네이버 환율 요청 실패: {e}")
@@ -175,10 +176,8 @@ def fetch_hana_usd_rate(target_date=None) -> dict | None:
         except Exception:
             return None
 
-    # ★ 수정: 여러 파싱 방법을 순차 시도
     rate = None
 
-    # 방법 1: no_today p 태그
     no_today = soup.find("p", class_="no_today")
     if no_today:
         inner_em = no_today.find("em")
@@ -186,7 +185,6 @@ def fetch_hana_usd_rate(target_date=None) -> dict | None:
             inner_em2 = inner_em.find("em")
             rate = _parse_split_number(inner_em2 or inner_em)
 
-    # 방법 2: 정규식으로 직접 숫자 추출
     if not rate or rate < 100:
         text = soup.get_text()
         m = re.search(r'(\d{1,4}\.\d{2})', text)
@@ -195,7 +193,6 @@ def fetch_hana_usd_rate(target_date=None) -> dict | None:
             if 900 < candidate < 2000:
                 rate = candidate
 
-    # 방법 3: span.blind 텍스트에서 KRW 범위 숫자 찾기
     if not rate or rate < 100:
         for span in soup.find_all("span"):
             txt = span.get_text(strip=True).replace(",", "")
@@ -338,68 +335,92 @@ def _safe_val(v):
     return v
 
 
-# ── 세션 ────────────────────────────────────────────────
+# ── 세션 (★ 전체 교체) ───────────────────────────────────
 def get_session():
     s = requests.Session()
+
+    # ★ 재시도 어댑터 설정
+    retry = Retry(
+        total=3,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://",  adapter)
+
     s.headers.update({
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/122.0.0.0 Safari/537.36"
         ),
-        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ko-KR,ko;q=0.9",
-        "Connection":      "keep-alive",
+        "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language":           "ko-KR,ko;q=0.9",
+        "Accept-Encoding":           "gzip, deflate, br",
+        "Connection":                "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
     })
-    try:
-        # ★ 수정: 세션 쿠키를 index.do에서 먼저 받아옴
-        r = s.get("https://www.pps.go.kr/bichuk/index.do", timeout=10)
-        time.sleep(1)
-        # jsessionid를 URL에서 추출하여 저장
-        m = re.search(r'jsessionid=([A-Za-z0-9_!\-]+)', r.url)
-        if not m:
-            m = re.search(r'jsessionid=([A-Za-z0-9_!\-]+)', r.text)
-        if m:
-            s._jsessionid = m.group(1)
-        else:
-            s._jsessionid = None
-    except Exception:
-        s._jsessionid = None
+
+    urls_to_try = [
+        "https://www.pps.go.kr/bichuk/index.do",
+        "http://www.pps.go.kr/bichuk/index.do",
+    ]
+
+    for init_url in urls_to_try:
+        try:
+            r = s.get(
+                init_url,
+                timeout=30,
+                verify=False,
+                allow_redirects=True
+            )
+            time.sleep(1.5)
+
+            m = re.search(r'jsessionid=([A-Za-z0-9_!\-]+)', r.url)
+            if not m:
+                m = re.search(r'jsessionid=([A-Za-z0-9_!\-]+)', r.text)
+            if not m:
+                jsid = s.cookies.get("JSESSIONID")
+                s._jsessionid = jsid if jsid else None
+            else:
+                s._jsessionid = m.group(1)
+
+            return s
+        except Exception as e:
+            st.warning(f"세션 초기화 실패 ({init_url}): {e}")
+            time.sleep(2)
+
+    s._jsessionid = None
     return s
 
 
 def _build_url_with_session(base_url, session):
-    """jsessionid가 있으면 URL 경로에 포함 (조달청 방식)"""
     jid = getattr(session, "_jsessionid", None)
     if jid:
-        # /bichuk/bbs/list.do;jsessionid=XXX?key=...
         path = base_url.replace("https://www.pps.go.kr", "")
         return f"https://www.pps.go.kr{path};jsessionid={jid}"
     return base_url
 
 
 # ──────────────────────────────────────────────────────────
-#  ★ 핵심 수정: 목록 크롤링
+#  목록 크롤링 (★ timeout + verify=False 적용)
 # ──────────────────────────────────────────────────────────
 def crawl_list(session, pages=1):
-    """
-    조달청 비철금속 목록에서 bbsSn 추출
-    실제 HTML: <tr onclick="goView('2604290001')"> 또는
-               <td><a href="#none" onclick="...goView('2604290001')...">
-    bbsSn 형태: 숫자 10자리 (예: 2604290001)
-    """
     items = []
     base  = _build_url_with_session(LIST_URL, session)
 
     for page in range(1, pages + 1):
         try:
             url = f"{base}?key=00823&pageIndex={page}&orderBy=bbsOrdr+desc&sc=&sw="
-            # 수정
-            res = session.get(url, timeout=30, verify=False)
+            res = session.get(
+                url,
+                timeout=30,      # ★ 15 → 30
+                verify=False     # ★ SSL 검증 비활성화
+            )
             res.raise_for_status()
             soup = BeautifulSoup(res.text, "html.parser")
 
-            # ★ 방법 1: <tr onclick="goView('NNNN')"> 패턴
             for tr in soup.select("table tbody tr"):
                 onclick = tr.get("onclick", "")
                 m = re.search(r"goView\(['\"]?(\d+)['\"]?\)", onclick)
@@ -407,7 +428,6 @@ def crawl_list(session, pages=1):
                     items.append(m.group(1))
                     continue
 
-                # ★ 방법 2: <a href="#none" onclick="..."> 또는 <td onclick="...">
                 for tag in tr.find_all(["a", "td"]):
                     onclick2 = tag.get("onclick", "")
                     m2 = re.search(r"goView\(['\"]?(\d+)['\"]?\)", onclick2)
@@ -419,7 +439,6 @@ def crawl_list(session, pages=1):
                             items.append(bbs_sn)
                         break
 
-            # ★ 방법 3: view.do?bbsSn=NNNN 형태 링크
             for a in soup.find_all("a", href=True):
                 href = a["href"]
                 m3 = re.search(r"bbsSn=(\d+)", href)
@@ -428,7 +447,6 @@ def crawl_list(session, pages=1):
                     if bbs_sn not in items:
                         items.append(bbs_sn)
 
-            # ★ 방법 4: 페이지 전체 텍스트에서 goView 패턴 검색 (최후 수단)
             if not items:
                 for m4 in re.finditer(r"goView\(['\"]?(\d{8,12})['\"]?\)", res.text):
                     bbs_sn = m4.group(1)
@@ -437,52 +455,48 @@ def crawl_list(session, pages=1):
 
         except Exception as e:
             st.warning(f"목록 크롤링 오류 (page={page}): {e}")
-        time.sleep(0.5)
+        time.sleep(1.0)   # ★ 0.5 → 1.0
 
     return items
 
 
 # ──────────────────────────────────────────────────────────
-#  ★ 핵심 수정: 상세 크롤링
+#  상세 크롤링 (★ timeout + verify=False 적용)
 # ──────────────────────────────────────────────────────────
 def crawl_detail(session, bbs_sn):
     base = _build_url_with_session(VIEW_URL, session)
     url  = f"{base}?bbsSn={bbs_sn}&key=00823&pageIndex=1&orderBy=bbsOrdr+desc&sc=&sw="
     try:
-            # 수정
-        res = session.get(url, timeout=30, verify=False)
+        res = session.get(
+            url,
+            timeout=30,      # ★ 15 → 30
+            verify=False     # ★ SSL 검증 비활성화
+        )
         res.raise_for_status()
     except Exception as e:
         return None
 
     soup = BeautifulSoup(res.text, "html.parser")
 
-    # 가격일자 추출
     price_date = None
     full_text  = soup.get_text()
 
-    # ★ 방법 1: <span>가격일자: 20260428</span>
     for span in soup.find_all("span"):
         t = span.get_text(strip=True)
         if "가격일자:" in t:
             price_date = t.replace("가격일자:", "").strip()
             break
 
-    # ★ 방법 2: 정규식으로 본문 전체 검색
     if not price_date:
         m = re.search(r"가격일자[:\s]*(\d{8})", full_text)
         if m:
             price_date = m.group(1)
 
-    # ★ 방법 3: 제목에서 날짜 추출 (일일가격 (20260428,현지시간))
     if not price_date:
         m = re.search(r'\((\d{8})[,\)]', full_text)
         if m:
             price_date = m.group(1)
 
-    # ★ 방법 4: bbsSn 앞 8자리 (2604290001 → 26042900 → 의미없음, 스킵)
-
-    # 가격 테이블 파싱
     content_div = soup.find("div", id="brdContent")
     if not content_div:
         return {"price_date": price_date, "data": {}}
@@ -508,11 +522,9 @@ def crawl_detail(session, bbs_sn):
 
         if th:
             th_text = th.get_text(strip=True)
-            # METALS에 해당하는 경우만 current_item 업데이트
             if th_text in METALS:
                 current_item = th_text
             elif th_text not in METALS:
-                # LMEX, 환율 등 → current_item 초기화
                 current_item = ""
 
         cells = [td.get_text(strip=True) for td in tds]
@@ -532,9 +544,8 @@ def crawl_detail(session, bbs_sn):
                     "전일대비":     safe_float(cells[7]) if len(cells) > 7 else None,
                 }
 
-        # ★ 환율 행 파싱 (현물종가 행)
         if th and th.get_text(strip=True) == "환율":
-            current_item = ""  # 이후 행 오염 방지
+            current_item = ""
             if len(cells) >= 3:
                 rows["환율"] = {
                     "전월평균":     safe_float(cells[0]) if len(cells) > 0 else None,
@@ -546,7 +557,6 @@ def crawl_detail(session, bbs_sn):
                     "전일대비":     safe_float(cells[4]) if len(cells) > 4 else None,
                 }
 
-    # 원유 가격 추가
     if price_date and len(price_date) == 8:
         oil_rows = fetch_oil_prices(pages=3)
         for oil_row in oil_rows:
@@ -563,7 +573,6 @@ def crawl_detail(session, bbs_sn):
                         "전일대비":     oil_row["전일대비"],
                     }
 
-    # 환율이 아직 없으면 네이버 환율 조회
     if "환율" not in rows:
         hana = fetch_hana_usd_rate()
         if hana:
@@ -758,9 +767,29 @@ if refresh or bulk:
     session = get_session()
     pages   = 20 if bulk else 1
 
-    # ★ 디버그: 세션 및 목록 파싱 상태 즉시 확인
+    # ★ 디버그: 세션 및 목록 파싱 상태 즉시 확인 (강화된 버전)
     with st.expander("🔍 세션 / 목록 디버그", expanded=True):
         st.write(f"jsessionid: `{getattr(session, '_jsessionid', 'None')}`")
+
+        # ★ DNS 해석 테스트
+        try:
+            ip = socket.gethostbyname("www.pps.go.kr")
+            st.success(f"DNS 해석 성공: www.pps.go.kr → {ip}")
+        except Exception as e:
+            st.error(f"DNS 해석 실패: {e} → 서버 자체 접근 불가")
+
+        # ★ HTTP(비SSL) 연결 테스트
+        try:
+            r_http = requests.get(
+                "http://www.pps.go.kr/bichuk/index.do",
+                timeout=20,
+                allow_redirects=True,
+                verify=False
+            )
+            st.success(f"HTTP 연결 성공: 상태코드 {r_http.status_code}")
+        except Exception as e:
+            st.error(f"HTTP 연결도 실패: {e}")
+
         test_url = (
             f"https://www.pps.go.kr/bichuk/bbs/list.do"
             f"{';jsessionid=' + session._jsessionid if session._jsessionid else ''}"
@@ -768,12 +797,10 @@ if refresh or bulk:
         )
         st.write(f"요청 URL: `{test_url}`")
         try:
-            test_res = session.get(test_url, timeout=15)
+            test_res = session.get(test_url, timeout=30, verify=False)
             st.write(f"HTTP 상태코드: `{test_res.status_code}`")
-            # goView 패턴 개수 확인
             found = re.findall(r"goView\(['\"]?(\d+)['\"]?\)", test_res.text)
             st.write(f"goView() 패턴 발견 수: `{len(found)}` → {found[:5]}")
-            # bbsSn 직접 검색
             found2 = re.findall(r"bbsSn=(\d+)", test_res.text)
             st.write(f"bbsSn= 패턴 발견 수: `{len(found2)}` → {found2[:5]}")
             if not found and not found2:
