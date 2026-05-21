@@ -821,8 +821,60 @@ with tab1:
 with tab2:
     today_dt = df_all["날짜"].max()
 
-    st.subheader("🔩 비철금속 판매가격 추이 (원/톤)")
+    st.subheader("비철금속 판매가격 추이 (원/톤)")
     sel_metals = st.multiselect(
-        "품목 선택", METALS, default=["구리", "알루미늄", "니켈"], key="sel_m"
+        "품목 선택", METALS,
+        default=["구리", "알루미늄", "니켈"],
+        key="sel_m"
+    )
+    period_metal = st.radio(
+        "기간",
+        options=["1개월", "3개월", "전체"],
+        horizontal=True,
+        key="p_m"
+    )
+    if sel_metals:
+        df_c = df_all[df_all["품목"].isin(sel_metals)].copy()
+        if period_metal == "1개월":
+            df_c = df_c[df_c["날짜"] >= today_dt - pd.Timedelta(days=30)]
+        elif period_metal == "3개월":
+            df_c = df_c[df_c["날짜"] >= today_dt - pd.Timedelta(days=90)]
+        pivot = df_c.pivot_table(
+            index="날짜", columns="품목", values="판매가격_원"
+        )
+        st.line_chart(pivot, use_container_width=True)
+
+    st.divider()
+
+    st.subheader("국제유가 추이 (USD/bbl)")
+    period_oil = st.radio(
+        "기간",
+        options=["1개월", "3개월", "전체"],
+        horizontal=True,
+        key="p_o"
+    )
+    df_oil = df_all[df_all["품목"].isin(OILS)].copy()
+    if not df_oil.empty:
+        if period_oil == "1개월":
+            df_oil = df_oil[df_oil["날짜"] >= today_dt - pd.Timedelta(days=30)]
+        elif period_oil == "3개월":
+            df_oil = df_oil[df_oil["날짜"] >= today_dt - pd.Timedelta(days=90)]
+        pivot_oil = df_oil.pivot_table(
+            index="날짜", columns="품목", values="당일Closing"
+        )
+        st.line_chart(pivot_oil, use_container_width=True)
+    else:
+        st.info("원유 데이터가 없습니다. 데이터 수집 후 다시 확인하세요.")
+
+    st.divider()
+
+    st.subheader("환율 추이 (KRW/USD)")
+    df_fx = (
+        df_all[df_all["품목"] == "환율"][["날짜", "당일Closing"]]
+        .set_index("날짜")
+    )
+    df_fx.columns = ["KRW/USD"]
+    st.line_chart(df_fx, use_container_width=True)
+
     )
     period = st.radio("기간", ["1개월", "3개월", "전체"], horizontal=True, key="p_
