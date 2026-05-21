@@ -689,103 +689,33 @@ tab1, tab2, tab3 = st.tabs(["📌 오늘 시황", "📈 추이 차트", "📊 �
 
 
 # ── TAB 1
-with tab1:
-    st.markdown(generate_comment(stats_df))
-    st.divider()
+    st.subheader("📋 전월대비 분석 테이블")
+    display_cols = ["품목", "최신가", "가격기준", "전일대비(%)",
+                    "당월누적평균", "전월평균", "전월대비변동(%)", "기준일"]
 
-    st.subheader("비철금속 판매가격 (원/톤, 부가세 포함)")
-    metal_stats = stats_df[stats_df["품목"].isin(METALS)]
-    cols = st.columns(len(METALS))
-    for i, (_, row) in enumerate(metal_stats.iterrows()):
-        price   = row.get("최신가")
-        chg     = row.get("전일대비")
-        lme     = row.get("LME_USD")
-        p_str   = ("₩" + format(int(float(price)), ",")) if pd.notna(price) and price is not None else "-"
-        d_str   = (("+" if float(chg) > 0 else "") + format(int(float(chg)), ",") + "원") if pd.notna(chg) and chg is not None else "-"
-        d_clr   = "normal" if pd.notna(chg) and chg is not None else "off"
-        lme_str = ("LME $" + str(round(float(lme), 1))) if pd.notna(lme) and lme is not None else ""
-        cols[i].metric(
-            label=row["품목"],
-            value=p_str,
-            delta=d_str,
-            delta_color=d_clr,
-            help=lme_str,
-        )
+    # ★ 실제 존재하는 컬럼만 필터링
+    display_cols = [c for c in display_cols if c in stats_df.columns]
 
-    st.divider()
+    # ★ 스타일 적용할 컬럼도 존재 여부 확인 후 적용
+    style_cols = [c for c in ["전일대비(%)", "전월대비변동(%)"] if c in display_cols]
 
-    st.subheader("국제유가 (USD/bbl)")
-    oil_live = fetch_oil_latest()
-    oc = st.columns(len(OILS))
-    for i, oil_name in enumerate(OILS):
-        if oil_name in oil_live:
-            o   = oil_live[oil_name]
-            p   = o.get("당일Closing")
-            pct = o.get("전일대비pct")
-            chg = o.get("전일대비")
-            if pct is not None and pd.notna(pct):
-                d_str = ("+" if float(pct) > 0 else "") + str(round(float(pct), 2)) + "%"
-                d_clr = "normal"
-            elif chg is not None and pd.notna(chg):
-                d_str = ("+" if float(chg) > 0 else "") + str(round(float(chg), 2))
-                d_clr = "normal"
-            else:
-                d_str = "-"
-                d_clr = "off"
-            oc[i].metric(
-                label=oil_name,
-                value=("$" + str(round(float(p), 2))) if p else "-",
-                delta=d_str,
-                delta_color=d_clr,
-            )
-        else:
-            oc[i].metric(label=oil_name, value="-", delta="-", delta_color="off")
+    # ★ 포맷 딕셔너리도 존재하는 컬럼만 적용
+    fmt_dict = {}
+    if "최신가"          in display_cols: fmt_dict["최신가"]          = "{:,.2f}"
+    if "전일대비(%)"     in display_cols: fmt_dict["전일대비(%)"]     = "{:+.2f}%"
+    if "당월누적평균"    in display_cols: fmt_dict["당월누적평균"]    = "{:,.2f}"
+    if "전월평균"        in display_cols: fmt_dict["전월평균"]        = "{:,.2f}"
+    if "전월대비변동(%)" in display_cols: fmt_dict["전월대비변동(%)"] = "{:+.2f}%"
 
-    st.divider()
+    styled = stats_df[display_cols].style.format(fmt_dict, na_rep="-")
+    if style_cols:
+        styled = styled.map(color_val, subset=style_cols)
 
-    st.subheader("전월대비 분석 테이블")
-    disp_cols = [
-        "품목", "최신가", "LME_USD", "가격기준",
-        "전일대비", "당월누적평균", "전월평균", "전월대비변동(%)", "기준일"
-    ]
-    fmt = {
-        "최신가":          "{:,.0f}",
-        "LME_USD":        "{:,.1f}",
-        "전일대비":        "{:+,.0f}",
-        "당월누적평균":    "{:,.0f}",
-        "전월평균":        "{:,.0f}",
-        "전월대비변동(%)": "{:+.2f}%",
-    }
     st.dataframe(
-        stats_df[disp_cols].style
-        .map(color_val, subset=["전일대비", "전월대비변동(%)"])
-        .format(fmt, na_rep="-"),
+        styled,
         use_container_width=True,
         hide_index=True,
     )
-
-    st.divider()
-
-    st.subheader("환율 (KRW/USD)")
-    fx_live = fetch_usd_rate()
-    fx_row  = stats_df[stats_df["품목"] == "환율"]
-    c1, c2, c3, c4 = st.columns(4)
-
-    live_rate = fx_live.get("당일Closing") if fx_live else None
-    live_chg  = fx_live.get("전일대비")    if fx_live else None
-    c1.metric(
-        "실시간 환율",
-        value=(str(round(float(live_rate), 2))) if live_rate else "-",
-        delta=(("+" if float(live_chg) > 0 else "") + str(round(float(live_chg), 2))) if live_chg else None,
-    )
-    if not fx_row.empty:
-        fx = fx_row.iloc[0]
-        avg_this = fx.get("당월누적평균")
-        avg_last = fx.get("전월평균")
-        mom      = fx.get("전월대비변동(%)")
-        c2.metric("당월 누적평균", str(round(float(avg_this), 2)) if pd.notna(avg_this) and avg_this is not None else "-")
-        c3.metric("전월 평균",     str(round(float(avg_last), 2)) if pd.notna(avg_last) and avg_last is not None else "-")
-        c4.metric("전월대비 변동", (("+" if float(mom) > 0 else "") + str(round(float(mom), 2)) + "%") if pd.notna(mom) and mom is not None else "-")
 
 
 # ── TAB 2
