@@ -453,27 +453,27 @@ def calc_stats(df):
 
     today      = df["날짜"].max()
     this_month = today.to_period("M")
-    last_month = this_month - 1
-    results    = []
+    last_month = (today.to_period("M") - 1)
 
+    results = []
     for item in METALS + OILS + ["환율"]:
+        # ★ .copy() 명시적으로 추가
         sub = df[df["품목"] == item].copy()
         if sub.empty:
             continue
 
-        if item in METALS:
-            price_col = "판매가격_원"
-            basis     = "원/톤(판매가)"
-        elif item in OILS:
-            price_col = "당일Closing"
-            basis     = "USD/bbl"
-        else:
-            price_col = "당일Closing"
-            basis     = "KRW/USD"
+        price_col = "당일Official" if item in METALS else "당일Closing"
 
-        sub["월"]  = sub["날짜"].dt.to_period("M")
-        this_m     = sub[sub["월"] == this_month][price_col].dropna()
-        last_m     = sub[sub["월"] == last_month][price_col].dropna()
+        # ★ price_col이 실제로 존재하는지 확인
+        if price_col not in sub.columns:
+            continue
+
+        # ★ 월 컬럼 추가 시 copy된 df에 직접 할당
+        sub = sub.copy()
+        sub["월"] = sub["날짜"].dt.to_period("M")
+
+        this_m = sub[sub["월"] == this_month][price_col].dropna()
+        last_m = sub[sub["월"] == last_month][price_col].dropna()
 
         avg_this = round(this_m.mean(), 2) if not this_m.empty else None
         avg_last = round(last_m.mean(), 2) if not last_m.empty else None
@@ -483,26 +483,40 @@ def calc_stats(df):
 
         latest       = sub.sort_values("날짜").iloc[-1]
         latest_price = latest.get(price_col)
-        chg_val      = latest.get("전일대비")
-        lme_usd      = latest.get("LME_USD") if item in METALS else None
+
+        chg_val = latest.get("전일대비")
+        if chg_val is None or (isinstance(chg_val, float) and pd.isna(chg_val)):
+            chg_val = latest.get("전일대비(%)")
+        if isinstance(chg_val, float) and pd.isna(chg_val):
+            chg_val = None
+
+        if item in METALS:
+            basis = "Official"
+        elif item in OILS:
+            basis = "USD/bbl"
+        else:
+            basis = "현물종가"
 
         results.append({
             "품목":            item,
             "최신가":          latest_price,
-            "LME_USD":        lme_usd,
             "가격기준":        basis,
-            "전일대비":        chg_val,
+            "전일대비(%)":     chg_val,
             "당월누적평균":    avg_this,
             "전월평균":        avg_last,
             "전월대비변동(%)": chg_pct,
             "기준일":          latest["날짜"].strftime("%Y-%m-%d"),
         })
 
-    out = pd.DataFrame(results)
-    for col in ["최신가", "LME_USD", "전일대비", "당월누적평균", "전월평균", "전월대비변동(%)"]:
-        if col in out.columns:
-            out[col] = pd.to_numeric(out[col], errors="coerce")
-    return out
+    if not results:
+        return pd.DataFrame()
+
+    result_df = pd.DataFrame(results)
+    for col in ["최신가", "전일대비(%)", "당월누적평균", "전월평균", "전월대비변동(%)"]:
+        if col in result_df.columns:
+            result_df[col] = pd.to_numeric(result_df[col], errors="coerce")
+    return result_df
+
 
 
 # ══════════════════════════════════════════════════════════
