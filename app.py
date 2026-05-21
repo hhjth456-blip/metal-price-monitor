@@ -394,7 +394,8 @@ def crawl_list(session, pages=1):
     for page in range(1, pages + 1):
         try:
             url = f"{base}?key=00823&pageIndex={page}&orderBy=bbsOrdr+desc&sc=&sw="
-            res = session.get(url, timeout=15)
+            # 수정
+            res = session.get(url, timeout=30, verify=False)
             res.raise_for_status()
             soup = BeautifulSoup(res.text, "html.parser")
 
@@ -448,7 +449,8 @@ def crawl_detail(session, bbs_sn):
     base = _build_url_with_session(VIEW_URL, session)
     url  = f"{base}?bbsSn={bbs_sn}&key=00823&pageIndex=1&orderBy=bbsOrdr+desc&sc=&sw="
     try:
-        res = session.get(url, timeout=15)
+            # 수정
+        res = session.get(url, timeout=30, verify=False)
         res.raise_for_status()
     except Exception as e:
         return None
