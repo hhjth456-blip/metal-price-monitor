@@ -689,6 +689,80 @@ tab1, tab2, tab3 = st.tabs(["📌 오늘 시황", "📈 추이 차트", "📊 �
 
 
 # ── TAB 1
+# ════════════════════════════════
+# TAB 1
+# ════════════════════════════════
+with tab1:
+    st.markdown(generate_comment(stats_df))
+    st.divider()
+
+    st.subheader("💡 당일 Official (CASH, USD/ton)")
+    metal_stats = stats_df[stats_df["품목"].isin(METALS)]
+    cols = st.columns(len(METALS))
+    for i, (_, row) in enumerate(metal_stats.iterrows()):
+        price = row.get("최신가")
+        chg   = row.get("전일대비(%)")
+        try:
+            delta_str   = f"{float(chg):+.2f}%" if chg is not None and pd.notna(chg) else "-"
+            delta_color = "normal" if chg is not None and pd.notna(chg) else "off"
+        except Exception:
+            delta_str, delta_color = "-", "off"
+        cols[i].metric(
+            label=row["품목"],
+            value=f"${float(price):,.2f}" if pd.notna(price) and price is not None else "-",
+            delta=delta_str,
+            delta_color=delta_color,
+        )
+
+    st.divider()
+
+    st.subheader("🛢️ 국제유가 (USD/bbl)")
+    oil_live = fetch_oil_latest()
+    oil_cols = st.columns(len(OILS))
+    for i, oil_name in enumerate(OILS):
+        if oil_name in oil_live:
+            o       = oil_live[oil_name]
+            o_price = o.get("당일Closing")
+            o_pct   = o.get("전일대비pct")
+            o_chg   = o.get("전일대비")
+            try:
+                if o_pct is not None:
+                    delta_str, delta_color = f"{float(o_pct):+.2f}%", "normal"
+                elif o_chg is not None:
+                    delta_str, delta_color = f"{float(o_chg):+.2f}", "normal"
+                else:
+                    delta_str, delta_color = "-", "off"
+            except Exception:
+                delta_str, delta_color = "-", "off"
+            oil_cols[i].metric(
+                label=oil_name,
+                value=f"${float(o_price):,.2f}" if o_price else "-",
+                delta=delta_str,
+                delta_color=delta_color,
+            )
+        else:
+            oil_cols[i].metric(label=oil_name, value="-", delta="-", delta_color="off")
+
+    oil_stats = stats_df[stats_df["품목"].isin(OILS)]
+    if not oil_stats.empty:
+        st.markdown("**월간 비교**")
+        oc1, oc2 = st.columns(2)
+        for idx, (_, row) in enumerate(oil_stats.iterrows()):
+            col_target = oc1 if idx == 0 else oc2
+            avg_this = row.get("당월누적평균")
+            avg_last = row.get("전월평균")
+            mom      = row.get("전월대비변동(%)")
+            col_target.markdown(
+                f"**{row['품목']}** · 당월평균 "
+                f"{'${:,.2f}'.format(float(avg_this)) if pd.notna(avg_this) else '-'} · "
+                f"전월평균 "
+                f"{'${:,.2f}'.format(float(avg_last)) if pd.notna(avg_last) else '-'} · "
+                f"변동 "
+                f"{'{:+.2f}%'.format(float(mom)) if pd.notna(mom) else '-'}"
+            )
+
+    st.divider()
+
     st.subheader("📋 전월대비 분석 테이블")
     display_cols = ["품목", "최신가", "가격기준", "전일대비(%)",
                     "당월누적평균", "전월평균", "전월대비변동(%)", "기준일"]
@@ -717,6 +791,31 @@ tab1, tab2, tab3 = st.tabs(["📌 오늘 시황", "📈 추이 차트", "📊 �
         hide_index=True,
     )
 
+    st.divider()
+
+    st.subheader("💱 환율 (KRW/USD)")
+    hana_live = fetch_hana_usd_rate()
+
+    if hana_live:
+        live_rate = hana_live.get("당일Closing")
+        live_chg  = hana_live.get("전일대비")
+        fx_row    = stats_df[stats_df["품목"] == "환율"]
+        avg_this  = fx_row.iloc[0].get("당월누적평균")    if not fx_row.empty else None
+        avg_last  = fx_row.iloc[0].get("전월평균")        if not fx_row.empty else None
+        mom_chg   = fx_row.iloc[0].get("전월대비변동(%)") if not fx_row.empty else None
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("💱 환율 (실시간)",
+                  f"{live_rate:,.2f}" if live_rate else "-",
+                  delta=f"{live_chg:+.2f}" if live_chg else None)
+        c2.metric("당월 누적 평균",
+                  f"{float(avg_this):,.2f}" if avg_this and pd.notna(avg_this) else "-")
+        c3.metric("전월 평균",
+                  f"{float(avg_last):,.2f}" if avg_last and pd.notna(avg_last) else "-")
+        c4.metric("전월대비 변동",
+                  f"{float(mom_chg):+.2f}%" if mom_chg and pd.notna(mom_chg) else "-")
+    else:
+        st.warning("⚠️ 환율 실시간 조회 실패")
 
 # ── TAB 2
 with tab2:
