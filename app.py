@@ -61,36 +61,44 @@ NAVER_HEADERS = {
 def fetch_pps_api_today():
     try:
         api_key = st.secrets["data_go_kr"]["api_key"]
-        
-        # URL과 params를 완전히 분리
-        base_url = "https://api.odcloud.kr/api/15151558/v1/uddi:e377eebd-ce29-4807-a362-90f4a0f5c486"
-        
+
         params = {
-            "page": "1",
-            "perPage": "10",
-            "returnType": "JSON",
-            "serviceKey": api_key
+            "page": 1,
+            "perPage": 10,
+            "serviceKey": api_key,
         }
-        
-        # requests가 params를 자동으로 ?key=value 형태로 붙여줌
+
         resp = requests.get(
-            base_url,
+            "https://api.odcloud.kr/api/15151558/v1/uddi:e377eebd-ce29-4807-a362-90f4a0f5c486",
             params=params,
             timeout=15,
             verify=False,
-            headers={"User-Agent": "Mozilla/5.0"}
         )
-        
-        # 디버깅용: 실제 요청된 URL 출력
-        st.write("📡 실제 요청 URL:", resp.url)
-        
         resp.raise_for_status()
-        return resp.json()
-        
+        json_data = resp.json()
+
+        result = {}
+        for row in json_data.get("data", []):
+            name = str(row.get("물품분류이름", "")).strip()
+            try:
+                price = float(str(row.get("종가", "0")).replace(",", ""))
+            except:
+                price = 0.0
+            try:
+                pct = float(str(row.get("변동폭", "0")).replace(",", ""))
+            except:
+                pct = 0.0
+
+            result[name] = {
+                "당일Closing": price,
+                "전일대비":    pct,
+            }
+
+        return result
+
     except Exception as e:
         st.error(f"API 오류: {e}")
-        return None
-
+        return {}
 
     data = js.get("data", [])
     if not data:
