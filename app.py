@@ -309,23 +309,34 @@ def fetch_hana_usd_rate() -> dict | None:
 #  Google Sheets
 # ══════════════════════════════════════════════════════════
 @st.cache_resource
+import os
+import json
+
 def get_gsheet():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds  = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"], scopes=scopes
-    )
+
+    # Fly.io 환경변수 우선, 없으면 st.secrets fallback (로컬 개발용)
+    gcp_env = os.environ.get("GCP_SERVICE_ACCOUNT")
+    if gcp_env:
+        service_account_info = json.loads(gcp_env)
+        spreadsheet_id       = os.environ["SPREADSHEET_ID"]
+        worksheet_name       = os.environ["WORKSHEET_NAME"]
+    else:
+        service_account_info = st.secrets["gcp_service_account"]
+        spreadsheet_id       = st.secrets["sheets"]["spreadsheet_id"]
+        worksheet_name       = st.secrets["sheets"]["worksheet_name"]
+
+    creds  = Credentials.from_service_account_info(service_account_info, scopes=scopes)
     client = gspread.authorize(creds)
-    sheet  = client.open_by_key(st.secrets["sheets"]["spreadsheet_id"])
+    sheet  = client.open_by_key(spreadsheet_id)
+
     try:
-        ws = sheet.worksheet(st.secrets["sheets"]["worksheet_name"])
+        ws = sheet.worksheet(worksheet_name)
     except gspread.WorksheetNotFound:
-        ws = sheet.add_worksheet(
-            title=st.secrets["sheets"]["worksheet_name"],
-            rows=10000, cols=20
-        )
+        ws = sheet.add_worksheet(title=worksheet_name, rows=10000, cols=20)
     return ws
 
 
