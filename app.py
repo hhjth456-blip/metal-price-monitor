@@ -58,34 +58,25 @@ NAVER_HEADERS = {
 # ══════════════════════════════════════════════════════════
 #  공공데이터포털 API - 비철금속 당일 가격 수집
 # ══════════════════════════════════════════════════════════
-def fetch_pps_api_today() -> dict | None:
-    """
-    새 API (15151558) 호출 → 당일 비철금속 6종 가격 반환
-    반환: {"알루미늄": {"당일Closing": ..., "전일대비": ...}, ...}
-
-    API 응답 컬럼:
-      물품분류이름 | 물품분류번호 | 종가 | 변동폭 |
-      런던금속거래소지수 | 런던금속거래소지수변동폭
-    """
+def fetch_pps_api_today():
     api_key = st.secrets["data_go_kr"]["api_key"]
-
+    
+    url = "https://api.odcloud.kr/api/15151558/v1/uddi:e377eebd-ce29-4807-a362-90f4a0f5c486"
+    
+    params = {
+        "page": 1,
+        "perPage": 10,
+        "returnType": "JSON",
+        "serviceKey": api_key   # ← URL에 직접 붙이지 말고 params에 넣기
+    }
+    
     try:
-        params = {
-            "page":        1,
-            "perPage":     10,
-            "returnType":  "JSON",
-            "serviceKey":  api_key,
-        }
-        res = requests.get(
-            PPS_API_URL,
-            params=params,
-            timeout=15,
-            verify=False,
-        )
-        res.raise_for_status()
-        js = res.json()
+        resp = requests.get(url, params=params, timeout=10, verify=False)
+        resp.raise_for_status()
+        data = resp.json()
+        return data
     except Exception as e:
-        st.warning(f"공공데이터 API 오류: {e}")
+        st.error(f"API 오류: {e}")
         return None
 
     data = js.get("data", [])
