@@ -59,25 +59,38 @@ NAVER_HEADERS = {
 #  공공데이터포털 API - 비철금속 당일 가격 수집
 # ══════════════════════════════════════════════════════════
 def fetch_pps_api_today():
-    api_key = st.secrets["data_go_kr"]["api_key"]
-    
-    url = "https://api.odcloud.kr/api/15151558/v1/uddi:e377eebd-ce29-4807-a362-90f4a0f5c486"
-    
-    params = {
-        "page": 1,
-        "perPage": 10,
-        "returnType": "JSON",
-        "serviceKey": api_key   # ← URL에 직접 붙이지 말고 params에 넣기
-    }
-    
     try:
-        resp = requests.get(url, params=params, timeout=10, verify=False)
+        api_key = st.secrets["data_go_kr"]["api_key"]
+        
+        # URL과 params를 완전히 분리
+        base_url = "https://api.odcloud.kr/api/15151558/v1/uddi:e377eebd-ce29-4807-a362-90f4a0f5c486"
+        
+        params = {
+            "page": "1",
+            "perPage": "10",
+            "returnType": "JSON",
+            "serviceKey": api_key
+        }
+        
+        # requests가 params를 자동으로 ?key=value 형태로 붙여줌
+        resp = requests.get(
+            base_url,
+            params=params,
+            timeout=15,
+            verify=False,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        
+        # 디버깅용: 실제 요청된 URL 출력
+        st.write("📡 실제 요청 URL:", resp.url)
+        
         resp.raise_for_status()
-        data = resp.json()
-        return data
+        return resp.json()
+        
     except Exception as e:
         st.error(f"API 오류: {e}")
         return None
+
 
     data = js.get("data", [])
     if not data:
