@@ -8,9 +8,6 @@ import time
 import gspread
 from google.oauth2.service_account import Credentials
 import urllib3
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import socket
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -24,11 +21,10 @@ st.set_page_config(
 METALS = ["알루미늄", "납", "아연", "구리", "주석", "니켈"]
 OILS   = ["WTI", "브렌트유"]
 
-# 공공데이터포털 API (조달청 비축물자 원자재 일일가격)
-PPS_API_URL = (
-    "https://api.odcloud.kr/api/15151568/v1/"
-    "uddi:18394309-5202-4567-9914-ab9b3a05712c"
-)
+# 조달청 비축물자 게시판
+PPS_LIST_URL = "https://pps.go.kr/bichuk/bbs/list.do"
+PPS_VIEW_URL = "https://pps.go.kr/bichuk/bbs/view.do"
+PPS_BBS_KEY  = "00823"   # 비철금속국제가격 게시판
 
 NAVER_OIL_URLS = {
     "WTI":    "https://finance.naver.com/marketindex/worldDailyQuote.naver?marketindexCd=OIL_CL&fdtc=2",
@@ -36,136 +32,359 @@ NAVER_OIL_URLS = {
 }
 NAVER_FX_URL = "https://finance.naver.com/marketindex/exchangeDetail.naver?marketindexCd=FX_USDKRW"
 
+# 공통 헤더 (조달청 차단 우회)
+PPS_HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/124.0.0.0 Safari/537.36",
+    "Referer":         "https://pps.go.kr/bichuk/bbs/list.do?key=00823",
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ko-KR,ko;q=0.9",
+    "Connection":      "keep-alive",
+}
 
-# ──────────────────────────────────────────────────────────
-#  공공데이터포털 API로 조달청 비철금속 가격 수집
-# ──────────────────────────────────────────────────────────
-def fetch_pps_api(total_pages: int = 1) -> pd.DataFrame:
-    api_key = st.secrets["data_go_kr"]["api_key"]
-    all_rows = []
+
+# ══════════════════════════════════════════════════════════
+#  조달청 pps.go.kr 크롤링 — 목록 수집
+# ══════════════════════════════════════════════════════════
+def fetch_pps_list(total_pages: int = 1) -> list[dict]:
+    """
+    게시판 목록에서 bbsSn, 제목(날짜 포함), 등록일 수집
+    반환: [{"bbsSn": "...", "title": "...", "reg_date": "..."}, ...]
+    """
+    entries = []
+    session = requests.Session()
 
     for page in range(1, total_pages + 1):
+        params = {
+            "key":       PPS_BBS_KEY,
+            "pageIndex": page,
+            "orderBy":   "bbsOrdr desc",
+        }
         try:
-            params = {
-                "page":       page,
-                "perPage":    100,
-                "returnType": "JSON",
-                "serviceKey": api_key,
-            }
-            res = requests.get(
-                PPS_API_URL,
+            res = session.get(
+                PPS_LIST_URL,
                 params=params,
-                timeout=15,
-                verify=False
+                headers=PPS_HEADERS,
+                timeout=20,
+                verify=False,
             )
             res.raise_for_status()
-            js = res.json()
-
-            data = js.get("data", [])
-            if not data:
-                break
-
-            all_rows.extend(data)
-
-            total_count = js.get("totalCount", 0)
-            per_page    = js.get("perPage", 100)
-            if page * per_page >= total_count:
-                break
-
         except Exception as e:
-            st.warning(f"공공데이터 API 오류 (page={page}): {e}")
+            st.warning(f"게시판 목록 요청 실패 (page={page}): {e}")
             break
-        time.sleep(0.3)
 
-    if not all_rows:
-        return pd.DataFrame()
+        soup = BeautifulSoup(res.text, "html.parser")
+        tbl  = soup.find("table")
+        if not tbl:
+            st.warning(f"page={page}: 테이블을 찾지 못했습니다.")
+            break
 
-    df = pd.DataFrame(all_rows)
-    return df
+        rows = tbl.select("tbody tr")
+        if not rows:
+            break
+
+        for tr in rows:
+            tds = tr.find_all("td")
+            if len(tds) < 4:
+                continue
+
+            # bbsSn — <a href="...bbsSn=XXXX..."> 또는 onclick 에서 추출
+            link_tag = tr.find("a", href=True)
+            bbsSn = None
+            if link_tag:
+                href = link_tag["href"]
+                m = re.search(r"bbsSn=(\d+)", href)
+                if m:
+                    bbsSn = m.group(1)
+
+            if not bbsSn:
+                # onclick 에서도 시도
+                onclick = tr.get("onclick", "")
+                for tag in tr.find_all(True):
+                    onclick = onclick or tag.get("onclick", "")
+                m = re.search(r"bbsSn=(\d+)", onclick)
+                if m:
+                    bbsSn = m.group(1)
+
+            if not bbsSn:
+                continue
+
+            title    = tds[1].get_text(strip=True)
+            reg_date = tds[4].get_text(strip=True) if len(tds) > 4 else ""
+
+            # 제목에서 날짜 추출: "(20260522,현지시간)" → "20260522"
+            m_date = re.search(r"\((\d{8}),현지시간\)", title)
+            price_date = m_date.group(1) if m_date else None
+
+            entries.append({
+                "bbsSn":      bbsSn,
+                "title":      title,
+                "price_date": price_date,
+                "reg_date":   reg_date,
+            })
+
+        time.sleep(0.4)
+
+    return entries
 
 
-def parse_pps_api_to_gsheet(df_raw: pd.DataFrame) -> dict:
+# ══════════════════════════════════════════════════════════
+#  조달청 pps.go.kr 크롤링 — 상세 페이지 파싱
+# ══════════════════════════════════════════════════════════
+def fetch_pps_view(bbsSn: str, session: requests.Session | None = None) -> str | None:
+    """게시물 상세 페이지 HTML 반환"""
+    if session is None:
+        session = requests.Session()
+
+    params = {
+        "bbsSn":     bbsSn,
+        "key":       PPS_BBS_KEY,
+        "pageIndex": 1,
+        "orderBy":   "bbsOrdr desc",
+        "sc":        "",
+        "sw":        "",
+    }
+    try:
+        res = session.get(
+            PPS_VIEW_URL,
+            params=params,
+            headers=PPS_HEADERS,
+            timeout=20,
+            verify=False,
+        )
+        res.raise_for_status()
+        return res.text
+    except Exception as e:
+        st.warning(f"상세 페이지 요청 실패 (bbsSn={bbsSn}): {e}")
+        return None
+
+
+def parse_pps_view(html: str, price_date: str) -> dict | None:
     """
-    API 응답 컬럼을 Google Sheets 저장 형식으로 변환
-    반환: { "YYYYMMDD": { "품목명": { 컬럼들... }, ... }, ... }
+    상세 페이지 HTML → {품목명: {전월평균, 전주평균, ...}} 딕셔너리
+    가격 테이블은 '품목 가격구분 전월평균 전주평균 Official_전일 Closing_전일 Official_당일 Closing_당일 전일대비' 구조
     """
-    if df_raw.empty:
-        return {}
+    if not html:
+        return None
 
-    # ★ 실제 컬럼명 확인 후 매핑 (API 응답 구조에 따라 조정 필요)
-    with st.expander("🔍 API 원본 컬럼 확인", expanded=False):
-        st.write("컬럼 목록:", df_raw.columns.tolist())
-        st.dataframe(df_raw.head(5))
+    soup = BeautifulSoup(html, "html.parser")
+
+    # ── 본문 텍스트에서 파싱 (테이블이 pre/text 형태인 경우 대비) ──────
+    # 1) <table> 이 있는 경우
+    tbl = soup.find("table")
+    rows_data = []
+
+    if tbl:
+        rows_data = _parse_table_tag(tbl, price_date)
+
+    # 2) 테이블 파싱 실패시 → 본문 텍스트 라인 파싱
+    if not rows_data:
+        content_div = (
+            soup.find("div", class_="bbs_view_cont") or
+            soup.find("div", id="bbsContent")         or
+            soup.find("div", class_="cont")           or
+            soup.find("td", class_="cont")
+        )
+        raw_text = content_div.get_text("\n") if content_div else soup.get_text("\n")
+        rows_data = _parse_text_block(raw_text, price_date)
+
+    if not rows_data:
+        return None
 
     result = {}
+    for item, vals in rows_data.items():
+        result[item] = vals
+    return result
 
-    # 컬럼명 후보 매핑 (API 실제 응답에 맞게 자동 탐지)
-    col_map = {}
-    for col in df_raw.columns:
-        col_lower = col.lower().replace(" ", "").replace("_", "")
-        if any(k in col_lower for k in ["날짜", "일자", "date", "ymd"]):
-            col_map["날짜"] = col
-        elif any(k in col_lower for k in ["품목", "item", "metal", "자재"]):
-            col_map["품목"] = col
-        elif any(k in col_lower for k in ["전월평균", "prevmonth"]):
-            col_map["전월평균"] = col
-        elif any(k in col_lower for k in ["전주평균", "prevweek"]):
-            col_map["전주평균"] = col
-        elif any(k in col_lower for k in ["전일official", "prevofficial"]):
-            col_map["전일Official"] = col
-        elif any(k in col_lower for k in ["전일closing", "prevclosing"]):
-            col_map["전일Closing"] = col
-        elif any(k in col_lower for k in ["당일official", "todayofficial", "official"]):
-            col_map["당일Official"] = col
-        elif any(k in col_lower for k in ["당일closing", "todayclosing", "closing"]):
-            col_map["당일Closing"] = col
-        elif any(k in col_lower for k in ["전일대비", "change", "diff"]):
-            col_map["전일대비"] = col
 
-    def safe_float(v):
-        try:
-            return float(str(v).replace(",", ""))
-        except Exception:
-            return None
+def _safe_float(s: str) -> float | None:
+    """콤마 제거 후 float 변환, 실패시 None"""
+    try:
+        return float(str(s).replace(",", "").strip())
+    except Exception:
+        return None
 
-    for _, row in df_raw.iterrows():
-        date_val = row.get(col_map.get("날짜", ""), "")
-        item_val = row.get(col_map.get("품목", ""), "")
 
-        # 날짜 정규화 (YYYY-MM-DD → YYYYMMDD)
-        date_str = str(date_val).replace("-", "").replace(".", "").strip()
-        if len(date_str) != 8:
+def _parse_table_tag(tbl, price_date: str) -> dict:
+    """
+    HTML <table> 에서 비철금속 가격 파싱
+    조달청 테이블 구조:
+      행1(header): 품목 | 가격구분 | 전월평균 | 전주평균 | 전일날짜(2열) | 당일날짜(2열) | 전일대비
+      데이터행 : 알루미늄 | CASH | ... | ... | Official | Closing | Official | Closing | %
+    """
+    result = {}
+
+    # 헤더 행으로부터 열 인덱스 탐색
+    headers = []
+    for tr in tbl.find_all("tr"):
+        ths = tr.find_all(["th", "td"])
+        texts = [th.get_text(strip=True) for th in ths]
+        if any("전월" in t for t in texts):
+            headers = texts
+            break
+
+    # 데이터 행 수집
+    current_item = None
+    for tr in tbl.find_all("tr"):
+        tds = tr.find_all("td")
+        if not tds:
             continue
+        texts = [td.get_text(strip=True).replace(",", "") for td in tds]
 
-        # 품목명 정규화
-        item_str = str(item_val).strip()
-        matched_item = None
+        # 품목명 감지
         for metal in METALS:
-            if metal in item_str:
-                matched_item = metal
+            if any(metal in t for t in texts[:2]):
+                current_item = metal
                 break
-        if not matched_item:
-            continue
 
-        if date_str not in result:
-            result[date_str] = {}
+        # CASH 행만 수집 (Official 기준)
+        if current_item and any("CASH" in t for t in texts):
+            nums = []
+            for t in texts:
+                if t in METALS or "CASH" in t or "3M" in t:
+                    continue
+                # 숫자값만 추출
+                cleaned = re.sub(r"[^\d.\-]", "", t)
+                if cleaned:
+                    nums.append(_safe_float(cleaned))
+                else:
+                    nums.append(None)
 
-        result[date_str][matched_item] = {
-            "전월평균":     safe_float(row.get(col_map.get("전월평균", ""))),
-            "전주평균":     safe_float(row.get(col_map.get("전주평균", ""))),
-            "전일Official": safe_float(row.get(col_map.get("전일Official", ""))),
-            "전일Closing":  safe_float(row.get(col_map.get("전일Closing", ""))),
-            "당일Official": safe_float(row.get(col_map.get("당일Official", ""))),
-            "당일Closing":  safe_float(row.get(col_map.get("당일Closing", ""))),
-            "전일대비":     safe_float(row.get(col_map.get("전일대비", ""))),
-        }
+            # 숫자 순서: 전월평균, 전주평균, 전일Official, 전일Closing, 당일Official, 당일Closing, 전일대비(%)
+            nums = [n for n in nums if n is not None or True]
+            if len(nums) >= 6:
+                result[current_item] = {
+                    "전월평균":     nums[0] if len(nums) > 0 else None,
+                    "전주평균":     nums[1] if len(nums) > 1 else None,
+                    "전일Official": nums[2] if len(nums) > 2 else None,
+                    "전일Closing":  nums[3] if len(nums) > 3 else None,
+                    "당일Official": nums[4] if len(nums) > 4 else None,
+                    "당일Closing":  nums[5] if len(nums) > 5 else None,
+                    "전일대비":     nums[6] if len(nums) > 6 else None,
+                }
+            current_item = None  # 다음 품목을 위해 초기화
 
     return result
 
 
-# ──────────────────────────────────────────────────────────
-#  원유 가격 크롤링 (네이버 금융)
-# ──────────────────────────────────────────────────────────
+def _parse_text_block(text: str, price_date: str) -> dict:
+    """
+    텍스트 블록(pre 형태)에서 비철금속 가격 라인 파싱
+    예시 라인:
+      알루미늄   CASH     3,599.85    3,675.68   3,720.00  3,706.72  3,706.00  3,720.28  0.37
+    """
+    result = {}
+    lines  = text.splitlines()
+
+    for line in lines:
+        matched_metal = None
+        for metal in METALS:
+            if metal in line:
+                matched_metal = metal
+                break
+        if not matched_metal:
+            continue
+        if "CASH" not in line:
+            continue
+
+        # 모든 숫자 추출 (콤마 포함된 숫자 포함)
+        nums_raw = re.findall(r"[\d,]+\.?\d*", line)
+        nums     = []
+        for n in nums_raw:
+            v = _safe_float(n)
+            if v is not None and v > 0:
+                nums.append(v)
+
+        # 전월평균, 전주평균, 전일Official, 전일Closing, 당일Official, 당일Closing, 전일대비(%)
+        if len(nums) >= 6:
+            # 전일대비는 음수일 수 있으므로 원본 텍스트에서 별도 추출
+            chg_match = re.search(r"(-?\d+\.?\d*)\s*$", line.strip())
+            chg_val   = _safe_float(chg_match.group(1)) if chg_match else None
+
+            result[matched_metal] = {
+                "전월평균":     nums[0],
+                "전주평균":     nums[1],
+                "전일Official": nums[2],
+                "전일Closing":  nums[3],
+                "당일Official": nums[4],
+                "당일Closing":  nums[5],
+                "전일대비":     chg_val,
+            }
+
+    # 환율 파싱
+    for line in lines:
+        if "환율" in line or "현물종가" in line:
+            nums_raw = re.findall(r"[\d,]+\.?\d*", line)
+            nums     = [_safe_float(n) for n in nums_raw if _safe_float(n) and _safe_float(n) > 100]
+            if nums:
+                chg_match = re.search(r"(-?\d+\.?\d*)\s*$", line.strip())
+                chg_val   = _safe_float(chg_match.group(1)) if chg_match else None
+                result["환율_pps"] = {
+                    "전월평균":     nums[0] if len(nums) > 0 else None,
+                    "전주평균":     nums[1] if len(nums) > 1 else None,
+                    "전일Official": None,
+                    "전일Closing":  nums[2] if len(nums) > 2 else None,
+                    "당일Official": None,
+                    "당일Closing":  nums[3] if len(nums) > 3 else None,
+                    "전일대비":     chg_val,
+                }
+            break
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════
+#  통합 수집 함수 (목록 → 상세 → 파싱)
+# ══════════════════════════════════════════════════════════
+def fetch_pps_metals(total_pages: int = 1) -> dict:
+    """
+    조달청 크롤링 메인 함수
+    반환: {"YYYYMMDD": {"알루미늄": {...}, "납": {...}, ...}, ...}
+    """
+    entries = fetch_pps_list(total_pages=total_pages)
+    if not entries:
+        return {}
+
+    result  = {}
+    session = requests.Session()
+    total   = len(entries)
+
+    prog_bar = st.progress(0, text="상세 페이지 크롤링 중...")
+
+    for i, entry in enumerate(entries):
+        bbsSn      = entry["bbsSn"]
+        price_date = entry.get("price_date")
+
+        if not price_date:
+            prog_bar.progress((i + 1) / total)
+            continue
+
+        # 이미 파싱된 날짜는 skip
+        if price_date in result:
+            prog_bar.progress((i + 1) / total)
+            continue
+
+        html = fetch_pps_view(bbsSn, session=session)
+        if not html:
+            prog_bar.progress((i + 1) / total)
+            time.sleep(0.3)
+            continue
+
+        parsed = parse_pps_view(html, price_date)
+        if parsed:
+            result[price_date] = parsed
+
+        prog_bar.progress((i + 1) / total, text=f"크롤링 중... {price_date} ({i+1}/{total})")
+        time.sleep(0.5)  # 서버 부하 방지
+
+    prog_bar.empty()
+    return result
+
+
+# ══════════════════════════════════════════════════════════
+#  원유 가격 크롤링 (네이버 금융) — 기존 유지
+# ══════════════════════════════════════════════════════════
 def fetch_oil_prices(pages: int = 1) -> list:
     headers = {
         "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
@@ -256,9 +475,9 @@ def fetch_oil_latest() -> dict:
     return latest
 
 
-# ──────────────────────────────────────────────────────────
-#  환율 크롤링 (네이버 금융)
-# ──────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════
+#  환율 크롤링 (네이버 금융) — 기존 유지
+# ══════════════════════════════════════════════════════════
 def fetch_hana_usd_rate() -> dict | None:
     headers = {
         "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
@@ -331,7 +550,9 @@ def fetch_hana_usd_rate() -> dict | None:
     return {"당일Official": None, "당일Closing": rate, "전일대비": chg}
 
 
-# ── Google Sheets 연결 ────────────────────────────────────
+# ══════════════════════════════════════════════════════════
+#  Google Sheets 연결 — 기존 유지
+# ══════════════════════════════════════════════════════════
 @st.cache_resource
 def get_gsheet():
     scopes = [
@@ -435,7 +656,9 @@ def save_to_gsheet(price_date: str, data: dict) -> pd.DataFrame:
         return df_existing if not df_existing.empty else pd.DataFrame()
 
 
-# ── 통계 계산 ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════
+#  통계 계산 — 기존 유지
+# ══════════════════════════════════════════════════════════
 def calc_stats(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
@@ -495,13 +718,15 @@ def calc_stats(df: pd.DataFrame) -> pd.DataFrame:
     return result_df
 
 
-# ── 시황 코멘트 ───────────────────────────────────────────
+# ══════════════════════════════════════════════════════════
+#  시황 코멘트 / 색상 — 기존 유지
+# ══════════════════════════════════════════════════════════
 def generate_comment(stats_df: pd.DataFrame) -> str:
     if stats_df.empty:
         return "데이터 없음"
 
-    today_str                          = datetime.now().strftime("%Y년 %m월 %d일")
-    lines                              = [f"**📋 {today_str} 비철금속·원유 시황 요약**\n"]
+    today_str = datetime.now().strftime("%Y년 %m월 %d일")
+    lines     = [f"**📋 {today_str} 비철금속·원유 시황 요약**\n"]
     up_items, dn_items, flat_items, big_movers = [], [], [], []
 
     for _, row in stats_df.iterrows():
@@ -535,15 +760,14 @@ def generate_comment(stats_df: pd.DataFrame) -> str:
         fx_val  = fx.get("최신가")
         fx_chg  = fx.get("전일대비(%)")
         fx_mom  = fx.get("전월대비변동(%)")
-        fx_str  = f"{float(fx_val):,.2f}"   if pd.notna(fx_val) and fx_val is not None else "-"
-        chg_str = f"{float(fx_chg):+.2f}%"  if pd.notna(fx_chg) and fx_chg is not None else "-"
-        mom_str = f"{float(fx_mom):+.2f}%"  if pd.notna(fx_mom) and fx_mom is not None else "-"
+        fx_str  = f"{float(fx_val):,.2f}"  if pd.notna(fx_val) and fx_val is not None else "-"
+        chg_str = f"{float(fx_chg):+.2f}%" if pd.notna(fx_chg) and fx_chg is not None else "-"
+        mom_str = f"{float(fx_mom):+.2f}%" if pd.notna(fx_mom) and fx_mom is not None else "-"
         lines.append(f"\n💱 **환율(KRW/USD):** {fx_str} (전일대비 {chg_str} / 전월대비 {mom_str})")
 
     return "\n\n".join(lines)
 
 
-# ── 색상 스타일 ───────────────────────────────────────────
 def color_val(val):
     if val is None:
         return ""
@@ -561,7 +785,8 @@ def color_val(val):
 # ══════════════════════════════════════════════════════════
 st.title("📊 비철금속·원유 시황 모니터")
 st.caption(
-    "비철금속 원가데이터: 공공데이터포털(조달청 비축물자) | LME USD: 한국비철금속협회 | 원유/환율: 네이버 금융 | Google Sheets 누적 저장"
+    "비철금속 원가데이터: 조달청 비축물자(pps.go.kr) 직접 크롤링 | "
+    "원유/환율: 네이버 금융 | Google Sheets 누적 저장"
 )
 
 col_btn, col_upd, col_info = st.columns([1, 1, 4])
@@ -575,64 +800,66 @@ with col_info:
 
 # ── 데이터 수집 ───────────────────────────────────────────
 if refresh or bulk:
-    total_pages = 50 if bulk else 1
+    total_pages = 50 if bulk else 1  # 1페이지 = 최근 10건
 
-    with st.spinner("공공데이터 API에서 비철금속 가격 수집 중..."):
-        df_pps = fetch_pps_api(total_pages=total_pages)
+    with st.spinner("조달청 게시판 목록 수집 중..."):
+        parsed = fetch_pps_metals(total_pages=total_pages)
 
-    if df_pps.empty:
-        st.error("❌ 공공데이터 API 응답이 없습니다. API 키와 네트워크를 확인하세요.")
+    if not parsed:
+        st.error(
+            "❌ 조달청(pps.go.kr) 크롤링 실패.\n\n"
+            "네트워크 연결 또는 사이트 차단 여부를 확인하세요.\n"
+            "Streamlit Cloud 배포 환경에서는 조달청이 일부 IP를 차단할 수 있습니다."
+        )
     else:
-        st.success(f"✅ API에서 {len(df_pps)}행 수신")
+        st.success(f"✅ {len(parsed)}일치 데이터 파싱 완료")
 
-        parsed = parse_pps_api_to_gsheet(df_pps)
+        progress    = st.progress(0)
+        saved_count = 0
+        date_list   = list(parsed.keys())
 
-        if not parsed:
-            st.error("❌ 품목 파싱 실패 — 위 '컬럼 확인' 섹션에서 실제 컬럼명을 확인하세요.")
-        else:
-            progress    = st.progress(0)
-            saved_count = 0
-            date_list   = list(parsed.keys())
+        oil_rows = fetch_oil_prices(pages=2)  # 원유 가격 한 번만 수집
 
-            for i, date_str in enumerate(date_list):
-                data = parsed[date_str]
+        for i, date_str in enumerate(date_list):
+            data = parsed[date_str]
 
-                # 원유 가격 추가
-                oil_rows = fetch_oil_prices(pages=2)
-                for oil_row in oil_rows:
-                    if oil_row["날짜"] == date_str:
-                        oil_name = oil_row["품목"]
-                        if oil_name not in data:
-                            data[oil_name] = {
-                                "전월평균":     None,
-                                "전주평균":     None,
-                                "전일Official": None,
-                                "전일Closing":  None,
-                                "당일Official": None,
-                                "당일Closing":  oil_row["당일Closing"],
-                                "전일대비":     oil_row["전일대비"],
-                            }
-
-                # 환율 추가
-                if "환율" not in data:
-                    hana = fetch_hana_usd_rate()
-                    if hana:
-                        data["환율"] = {
+            # 원유 가격 추가
+            for oil_row in oil_rows:
+                if oil_row["날짜"] == date_str:
+                    oil_name = oil_row["품목"]
+                    if oil_name not in data:
+                        data[oil_name] = {
                             "전월평균":     None,
                             "전주평균":     None,
                             "전일Official": None,
                             "전일Closing":  None,
                             "당일Official": None,
-                            "당일Closing":  hana.get("당일Closing"),
-                            "전일대비":     hana.get("전일대비"),
+                            "당일Closing":  oil_row["당일Closing"],
+                            "전일대비":     oil_row["전일대비"],
                         }
 
-                save_to_gsheet(date_str, data)
-                saved_count += 1
-                progress.progress((i + 1) / len(date_list))
-                time.sleep(0.2)
+            # 환율 추가 (조달청 본문에서 이미 파싱된 경우 우선, 없으면 네이버)
+            if "환율_pps" in data:
+                data["환율"] = data.pop("환율_pps")
+            elif "환율" not in data:
+                hana = fetch_hana_usd_rate()
+                if hana:
+                    data["환율"] = {
+                        "전월평균":     None,
+                        "전주평균":     None,
+                        "전일Official": None,
+                        "전일Closing":  None,
+                        "당일Official": None,
+                        "당일Closing":  hana.get("당일Closing"),
+                        "전일대비":     hana.get("전일대비"),
+                    }
 
-            st.success(f"✅ {saved_count}일치 데이터 저장 완료!")
+            save_to_gsheet(date_str, data)
+            saved_count += 1
+            progress.progress((i + 1) / len(date_list))
+            time.sleep(0.1)
+
+        st.success(f"✅ {saved_count}일치 데이터 Google Sheets 저장 완료!")
 
     st.cache_data.clear()
 
@@ -829,7 +1056,7 @@ with tab3:
 
     monthly = df_item.groupby("월")[val_col].mean().reset_index()
     monthly.columns = ["월", f"월평균({label})"]
-    monthly[f"월평균({label})"]  = monthly[f"월평균({label})"].round(2)
+    monthly[f"월평균({label})"] = monthly[f"월평균({label})"].round(2)
     monthly["전월대비(%)"] = monthly[f"월평균({label})"].pct_change().mul(100).round(2)
 
     st.bar_chart(monthly.set_index("월")[f"월평균({label})"], use_container_width=True)
@@ -857,7 +1084,7 @@ with tab3:
 
 st.divider()
 st.caption(
-    "📌 CASH 기준 LME Official 가격 / 공공데이터포털 조달청 API / "
+    "📌 CASH 기준 LME Official 가격 / 조달청 비축물자(pps.go.kr) 크롤링 / "
     "🛢️ WTI·브렌트유: 네이버 금융 (선물 종가, USD/bbl) / "
-    "환율: 네이버 금융 현물종가 기준 / 비상업적 참고용"
+    "환율: 조달청 게시물 또는 네이버 금융 현물종가 기준 / 비상업적 참고용"
 )
