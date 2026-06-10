@@ -1,8 +1,9 @@
 import streamlit as st
+import yfinance as yf
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 import time
 import gspread
@@ -18,14 +19,24 @@ st.set_page_config(
 )
 
 # ── 상수 ─────────────────────────────────────────────────
-# 한국비철금속협회 컬럼 순서: Cu(구리), Al(알루미늄), Zn(아연), Pb(납), Ni(니켈), Sn(주석)
-METALS      = ["알루미늄", "납", "아연", "구리", "주석", "니켈"]
-METALS_DISP = ["구리", "알루미늄", "아연", "납", "니켈", "주석"]  # 표시 순서
-OILS        = ["WTI", "브렌트유"]
+METALS = ["알루미늄", "납", "아연", "구리", "주석", "니켈"]
+OILS   = ["WTI", "브렌트유"]
 
-# 한국비철금속협회 LME 시세 (Cu, Al, Zn, Pb, Ni, Sn 순서)
-NONFERROUS_URL  = "https://www.nonferrous.or.kr/stats/?act=sub3"
-NONFERROUS_COL  = ["구리", "알루미늄", "아연", "납", "니켈", "주석"]  # 테이블 컬럼 순서
+# Yahoo Finance 티커 매핑
+# HG=F : 구리 COMEX (USD/lb)  → ×2204.62 = USD/ton
+# ALI=F: 알루미늄 CME (USD/ton)
+# ZN=F : 아연 CME (USD/ton)  ※ 주의: ZN=F는 10Y T-Note일 수 있음 → 별도처리
+# NI=F : 니켈 CME (USD/ton)
+# PB=F : 납 CME  (USD/ton)
+# SB=F : 주석 대용 없음 → 네이버 비철금속 크롤링으로 보완
+METAL_TICKERS = {
+    "구리":    ("HG=F",  "lb"),    # ×2204.62 → USD/ton
+    "알루미늄": ("ALI=F", "ton"),
+    "아연":    ("ZN=F",  "ton"),
+    "납":      ("PB=F",  "ton"),
+    "니켈":    ("NI=F",  "ton"),
+    "주석":    ("SN=F",  "ton"),   # SN=F 없으면 None 처리
+}
 
 NAVER_OIL_URLS = {
     "WTI":    "https://finance.naver.com/marketindex/worldDailyQuote.naver"
@@ -43,106 +54,86 @@ NAVER_HEADERS = {
     "Accept-Language": "ko-KR,ko;q=0.9",
 }
 
-NONFERROUS_HEADERS = {
-    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-    "Referer":         "https://www.nonferrous.or.kr/",
-    "Accept-Language": "ko-KR,ko;q=0.9",
-    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
-
 
 # ══════════════════════════════════════════════════════════
-#  한국비철금속협회 LME 시세 크롤링
+#  yfinance 비철금속 가격 수집
 # ══════════════════════════════════════════════════════════
-def fetch_nonferrous_lme(total_pages: int = 1) -> dict:
-    """
-    한국비철금속협회 LME 시세 크롤링
-    URL: https://www.nonferrous.or.kr/stats/?act=sub3&page={n}
-    테이블 컬럼: 일자 | Cu | Al | Zn | Pb | Ni | Sn
-    반환: {"YYYYMMDD": {"구리": {"당일Closing": ..., "전일대비": ...}, ...}, ...}
-    """
-    result  = {}
-    session = requests.Session()
+def _lb_to_ton(price: float) -> float:
+    """USD/lb → USD/metric ton"""
+    return round(price * 2204.62, 2)
 
-    for page in range(1, total_pages + 1):
-        url = f"{NONFERROUS_URL}&page={page}"
+
+@st.cache_data(ttl=3600)
+def fetch_metals_yfinance(days: int = 30) -> dict:
+    """
+    yfinance로 비철금속 선물 가격 수집
+    반환: {"YYYYMMDD": {"구리": {"당일Official": ..., "당일Closing": ...,
+                                 "전일Closing": ..., "전일대비": ...}, ...}, ...}
+    """
+    end_dt   = datetime.today()
+    start_dt = end_dt - timedelta(days=days + 10)  # 여유 있게 다운로드
+
+    result: dict[str, dict] = {}
+
+    for metal, (ticker, unit) in METAL_TICKERS.items():
         try:
-            res = session.get(
-                url,
-                headers=NONFERROUS_HEADERS,
-                timeout=20,
-                verify=False,
+            df = yf.download(
+                ticker,
+                start=start_dt.strftime("%Y-%m-%d"),
+                end=end_dt.strftime("%Y-%m-%d"),
+                progress=False,
+                auto_adjust=True,
             )
-            res.raise_for_status()
-        except Exception as e:
-            st.warning(f"한국비철금속협회 요청 실패 (page={page}): {e}")
-            break
-
-        soup = BeautifulSoup(res.text, "html.parser")
-        tbl  = soup.find("table")
-        if not tbl:
-            st.warning(f"page={page}: 테이블을 찾지 못했습니다.")
-            break
-
-        rows = tbl.select("tbody tr")
-        # 헤더 포함 구조일 때 th 행 제거
-        data_rows = [r for r in rows if r.find("td")]
-
-        if not data_rows:
-            break
-
-        prev_prices: dict[str, float | None] = {}
-
-        for tr in data_rows:
-            tds  = tr.find_all("td")
-            if len(tds) < 7:
+            if df.empty:
                 continue
 
-            # ── 날짜 파싱 ─────────────────────────────────
-            # 형식: "2026. 06. 09"  →  "20260609"
-            date_raw = tds[0].get_text(strip=True)
-            date_str = re.sub(r"\D", "", date_raw)   # 숫자만 추출
-            if len(date_str) != 8:
-                continue
+            # MultiIndex 정리
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
 
-            # ── 가격 파싱 (Cu, Al, Zn, Pb, Ni, Sn 순) ───
-            day_data: dict[str, dict] = {}
-            for idx, metal_name in enumerate(NONFERROUS_COL):
-                price_str = tds[idx + 1].get_text(strip=True).replace(",", "")
-                try:
-                    price = float(price_str)
-                except ValueError:
-                    price = None
+            df = df[["Close"]].copy()
+            df.index = pd.to_datetime(df.index).tz_localize(None)
+            df = df.sort_index()
 
-                # 전일대비 계산 (직전 행 대비, 최초 행은 None)
-                prev  = prev_prices.get(metal_name)
-                if price is not None and prev is not None and prev != 0:
-                    chg_pct = round((price - prev) / prev * 100, 2)
-                else:
-                    chg_pct = None
+            # 단위 변환 (구리: lb → ton)
+            if unit == "lb":
+                df["Close"] = df["Close"].apply(_lb_to_ton)
 
-                day_data[metal_name] = {
-                    "전월평균":     None,   # 협회 테이블에 없음
+            df["Prev"]  = df["Close"].shift(1)
+            df["ChgPct"] = ((df["Close"] - df["Prev"]) / df["Prev"] * 100).round(2)
+
+            for ts, row in df.iterrows():
+                date_str = ts.strftime("%Y%m%d")
+                price    = row["Close"]
+                prev     = row["Prev"]
+                chg      = row["ChgPct"]
+
+                if pd.isna(price):
+                    continue
+
+                if date_str not in result:
+                    result[date_str] = {}
+
+                result[date_str][metal] = {
+                    "전월평균":     None,
                     "전주평균":     None,
                     "전일Official": None,
-                    "전일Closing":  prev,   # 이 날의 전일 = 이전 행 Closing
-                    "당일Official": price,  # LME Cash = Official 기준
-                    "당일Closing":  price,
-                    "전일대비":     chg_pct,
+                    "전일Closing":  None if pd.isna(prev) else round(float(prev), 2),
+                    "당일Official": round(float(price), 2),
+                    "당일Closing":  round(float(price), 2),
+                    "전일대비":     None if pd.isna(chg) else float(chg),
                 }
-                prev_prices[metal_name] = price
 
-            result[date_str] = day_data
-
-        time.sleep(0.5)
+        except Exception as e:
+            st.warning(f"yfinance {metal}({ticker}) 오류: {e}")
+            continue
 
     return result
 
 
-def fetch_nonferrous_latest() -> dict:
-    """최신 1페이지(20건)만 수집"""
-    return fetch_nonferrous_lme(total_pages=1)
+def fetch_metals_latest() -> dict:
+    """최근 5일치만 수집 (오늘 시황용)"""
+    return fetch_metals_yfinance(days=5)
 
 
 # ══════════════════════════════════════════════════════════
@@ -181,7 +172,7 @@ def fetch_oil_prices(pages: int = 1) -> list:
                     for td_check in tds[1:3]:
                         for tag in td_check.find_all(True):
                             cls = " ".join(tag.get("class", []))
-                            if any(k in cls.lower() for k in ["down", "fall", "minus"]):
+                            if any(k in cls.lower() for k in ["down","fall","minus"]):
                                 is_down = True
                     img = tds[1].find("img")
                     if img:
@@ -189,7 +180,6 @@ def fetch_oil_prices(pages: int = 1) -> list:
                         src = img.get("src", "")
                         if "하락" in alt or "down" in src.lower():
                             is_down = True
-
                     try:
                         pct = float(pct_str.replace(",", "").replace("%", ""))
                         is_down = pct < 0 if pct != 0 else is_down
@@ -227,9 +217,8 @@ def fetch_oil_latest() -> dict:
     rows   = fetch_oil_prices(pages=1)
     latest = {}
     for r in rows:
-        name = r["품목"]
-        if name not in latest:
-            latest[name] = r
+        if r["품목"] not in latest:
+            latest[r["품목"]] = r
     return latest
 
 
@@ -445,7 +434,7 @@ def calc_stats(df: pd.DataFrame) -> pd.DataFrame:
         if isinstance(chg_val, float) and pd.isna(chg_val):
             chg_val = None
 
-        basis = "LME Cash" if item in METALS else (
+        basis = "COMEX 선물" if item in METALS else (
             "USD/bbl" if item in OILS else "현물종가"
         )
 
@@ -471,7 +460,7 @@ def calc_stats(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════════════════
-#  시황 코멘트
+#  시황 코멘트 / 색상
 # ══════════════════════════════════════════════════════════
 def generate_comment(stats_df: pd.DataFrame) -> str:
     if stats_df.empty:
@@ -516,13 +505,10 @@ def generate_comment(stats_df: pd.DataFrame) -> str:
 
     fx_row = stats_df[stats_df["품목"] == "환율"]
     if not fx_row.empty:
-        fx      = fx_row.iloc[0]
-        fx_val  = fx.get("최신가")
-        fx_chg  = fx.get("전일대비(%)")
-        fx_mom  = fx.get("전월대비변동(%)")
-        fx_s    = f"{float(fx_val):,.2f}"  if pd.notna(fx_val)  and fx_val  else "-"
-        chg_s   = f"{float(fx_chg):+.2f}%" if pd.notna(fx_chg) and fx_chg  else "-"
-        mom_s   = f"{float(fx_mom):+.2f}%" if pd.notna(fx_mom) and fx_mom  else "-"
+        fx    = fx_row.iloc[0]
+        fx_s  = f"{float(fx['최신가']):,.2f}"          if pd.notna(fx['최신가'])          else "-"
+        chg_s = f"{float(fx['전일대비(%)']):+.2f}%"    if pd.notna(fx['전일대비(%)'])    else "-"
+        mom_s = f"{float(fx['전월대비변동(%)']):+.2f}%" if pd.notna(fx['전월대비변동(%)']) else "-"
         lines.append(
             f"\n💱 **환율(KRW/USD):** {fx_s} "
             f"(전일대비 {chg_s} / 전월대비 {mom_s})"
@@ -546,7 +532,7 @@ def color_val(val):
 # ══════════════════════════════════════════════════════════
 st.title("📊 비철금속·원유 시황 모니터")
 st.caption(
-    "비철금속: 한국비철금속협회 LME Cash (nonferrous.or.kr) | "
+    "비철금속: Yahoo Finance (COMEX 선물, USD/ton 환산) | "
     "원유/환율: 네이버 금융 | Google Sheets 누적 저장"
 )
 
@@ -561,33 +547,33 @@ with col_info:
 
 # ── 데이터 수집 ───────────────────────────────────────────
 if refresh or bulk:
-    total_pages = 30 if bulk else 1  # 1페이지 ≒ 20영업일
+    fetch_metals_yfinance.clear()  # 캐시 초기화
 
-    with st.spinner("한국비철금속협회 LME 시세 수집 중..."):
-        parsed = fetch_nonferrous_lme(total_pages=total_pages)
+    days = 365 if bulk else 7
+
+    with st.spinner("Yahoo Finance에서 비철금속 선물 데이터 수집 중..."):
+        parsed = fetch_metals_yfinance(days=days)
 
     if not parsed:
-        st.error("❌ 한국비철금속협회 크롤링 실패. 네트워크를 확인하세요.")
+        st.error("❌ Yahoo Finance 데이터 수집 실패. 잠시 후 다시 시도하세요.")
     else:
-        st.success(f"✅ {len(parsed)}일치 비철금속 데이터 파싱 완료")
+        st.success(f"✅ {len(parsed)}일치 비철금속 데이터 수신")
 
-        # 원유 가격 수집
         with st.spinner("원유 가격 수집 중 (네이버 금융)..."):
-            oil_pages = 5 if bulk else 1
+            oil_pages = 3 if bulk else 1
             oil_rows  = fetch_oil_prices(pages=oil_pages)
 
-        # 환율 수집
         with st.spinner("환율 수집 중 (네이버 금융)..."):
             hana = fetch_hana_usd_rate()
 
         progress    = st.progress(0)
-        saved_count = 0
         date_list   = sorted(parsed.keys(), reverse=True)
+        saved_count = 0
 
         for i, date_str in enumerate(date_list):
             data = parsed[date_str]
 
-            # 원유 데이터 추가
+            # 원유 추가
             for oil_row in oil_rows:
                 if oil_row["날짜"] == date_str:
                     oil_name = oil_row["품목"]
@@ -620,10 +606,10 @@ if refresh or bulk:
                 (i + 1) / len(date_list),
                 text=f"저장 중... {date_str} ({i+1}/{len(date_list)})"
             )
-            time.sleep(0.1)
+            time.sleep(0.05)
 
         progress.empty()
-        st.success(f"✅ {saved_count}일치 데이터 Google Sheets 저장 완료!")
+        st.success(f"✅ {saved_count}일치 Google Sheets 저장 완료!")
         st.cache_data.clear()
 
 
@@ -648,7 +634,7 @@ with tab1:
     st.markdown(generate_comment(stats_df))
     st.divider()
 
-    st.subheader("💡 LME Cash (USD/ton)")
+    st.subheader("💡 비철금속 가격 (COMEX 선물, USD/ton)")
     metal_stats = stats_df[stats_df["품목"].isin(METALS)]
     cols = st.columns(len(METALS))
     for i, (_, row) in enumerate(metal_stats.iterrows()):
@@ -661,7 +647,7 @@ with tab1:
             delta_str, delta_color = "-", "off"
         cols[i].metric(
             label=row["품목"],
-            value=f"${float(price):,.1f}" if pd.notna(price) and price is not None else "-",
+            value=f"${float(price):,.0f}" if pd.notna(price) and price is not None else "-",
             delta=delta_str,
             delta_color=delta_color,
         )
@@ -762,7 +748,7 @@ with tab1:
 # TAB 2
 # ════════════════════════════════
 with tab2:
-    st.subheader("📈 LME Cash 가격 추이 (USD/ton)")
+    st.subheader("📈 비철금속 가격 추이 (USD/ton)")
     selected = st.multiselect(
         "품목 선택", options=METALS, default=["구리", "알루미늄", "니켈"]
     )
@@ -777,10 +763,9 @@ with tab2:
             df_chart = df_chart[df_chart["날짜"] >= today_dt - pd.Timedelta(days=30)]
         elif period == "3개월":
             df_chart = df_chart[df_chart["날짜"] >= today_dt - pd.Timedelta(days=90)]
-        pivot = df_chart.pivot_table(
-            index="날짜", columns="품목", values="당일Official"
-        )
-        st.line_chart(pivot, use_container_width=True)
+        pivot = df_chart.pivot_table(index="날짜", columns="품목", values="당일Official")
+        if not pivot.empty:
+            st.line_chart(pivot, use_container_width=True)
 
     st.divider()
     st.subheader("🛢️ 국제유가 추이 (USD/bbl)")
@@ -800,7 +785,8 @@ with tab2:
         pivot_oil = df_oil_chart.pivot_table(
             index="날짜", columns="품목", values="당일Closing"
         )
-        st.line_chart(pivot_oil, use_container_width=True)
+        if not pivot_oil.empty:
+            st.line_chart(pivot_oil, use_container_width=True)
     else:
         st.info("원유 데이터가 아직 없습니다.")
 
@@ -826,7 +812,7 @@ with tab3:
     df_item["월"] = df_item["날짜"].dt.to_period("M").astype(str)
 
     if item_sel in METALS:
-        val_col, label = "당일Official", "LME Cash"
+        val_col, label = "당일Official", "USD/ton"
     elif item_sel in OILS:
         val_col, label = "당일Closing", "USD/bbl"
     else:
@@ -868,6 +854,6 @@ with tab3:
 
 st.divider()
 st.caption(
-    "📌 LME Cash 기준 | 출처: 한국비철금속협회(nonferrous.or.kr) / "
-    "🛢️ 원유: 네이버 금융 / 💱 환율: 네이버 금융 | 비상업적 참고용"
+    "📌 비철금속: Yahoo Finance COMEX 선물 | 구리 USD/lb→ton 환산 포함 | "
+    "🛢️ 원유: 네이버 금융 | 💱 환율: 네이버 금융 | 비상업적 참고용"
 )
