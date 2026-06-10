@@ -29,6 +29,7 @@ ENARA_HEADERS = {
                        "AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
     "Referer":         "https://www.index.go.kr/",
     "Accept-Language": "ko-KR,ko;q=0.9",
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
 NAVER_OIL_URLS = {
@@ -52,6 +53,10 @@ NAVER_HEADERS = {
 #  비철금속 LME 클로징 크롤링 (e-나라지표)
 # ══════════════════════════════════════════════════════════
 def fetch_nonferrous_lme() -> dict:
+    """
+    e-나라지표 LME 시세 페이지에서 최신 2개 행을 파싱한다.
+    반환: {금속명: {price_date, 전일Official, 전일Closing, 당일Official, 당일Closing, 전일대비}}
+    """
     try:
         resp = requests.get(
             ENARA_URL,
@@ -62,17 +67,44 @@ def fetch_nonferrous_lme() -> dict:
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        table = soup.find("table")
+        # 테이블 탐색 – class 무관하게 첫 번째 데이터 테이블
+        tables = soup.find_all("table")
+        table  = None
+        for t in tables:
+            if t.select("tbody tr"):
+                table = t
+                break
+
         if not table:
             st.warning("e-나라지표: 테이블을 찾을 수 없습니다.")
             return {}
 
         rows = table.select("tbody tr")
         if len(rows) < 2:
-            st.warning("e-나라지표: 데이터 행 부족")
+            st.warning(f"e-나라지표: 데이터 행 부족 ({len(rows)}행)")
             return {}
 
-        def _parse(v):
+        # ── 헤더에서 컬럼 순서 동적 파악 ──────────────────
+        # 기본값: [날짜, 구리, 알루미늄, 아연, 납, 니켈, 주석]
+        default_col_map = {1: "구리", 2: "알루미늄", 3: "아연",
+                           4: "납",   5: "니켈",     6: "주석"}
+        col_map = default_col_map.copy()
+
+        header_row = table.select("thead tr")
+        if header_row:
+            ths = header_row[0].find_all(["th", "td"])
+            name_to_idx = {}
+            for i, th in enumerate(ths):
+                txt = th.get_text(strip=True)
+                for metal_name in ["구리", "알루미늄", "아연", "납", "니켈", "주석"]:
+                    if metal_name in txt:
+                        name_to_idx[metal_name] = i
+            if name_to_idx:
+                col_map = {v: k for k, v in name_to_idx.items()}
+                # col_map: {인덱스: 금속명}  형태로 재정렬
+                col_map = {idx: metal for metal, idx in name_to_idx.items()}
+
+        def _parse(v: str):
             try:
                 return float(str(v).replace(",", "").strip())
             except Exception:
@@ -84,9 +116,7 @@ def fetch_nonferrous_lme() -> dict:
         today_vals = _row_vals(rows[0])
         prev_vals  = _row_vals(rows[1])
 
-        # e-나라지표 컬럼: [날짜, 구리, 알루미늄, 아연, 납, 니켈, 주석]
-        col_map = {1: "구리", 2: "알루미늄", 3: "아연", 4: "납", 5: "니켈", 6: "주석"}
-
+        # 날짜 파싱 (YYYYMMDD 형태로 정제)
         date_raw   = today_vals[0].replace(".", "").replace(" ", "").replace("-", "")
         price_date = date_raw[:8] if len(date_raw) >= 8 else datetime.now().strftime("%Y%m%d")
 
@@ -148,6 +178,7 @@ def fetch_oil_prices(pages: int = 1) -> list:
                     chg_str   = tds[2].get_text(strip=True)
                     pct_str   = tds[3].get_text(strip=True) if len(tds) > 3 else ""
 
+                    # 상승/하락 방향 감지
                     is_down = False
                     for td_check in tds[1:3]:
                         for tag in td_check.find_all(True):
@@ -160,23 +191,35 @@ def fetch_oil_prices(pages: int = 1) -> list:
                         src = img.get("src", "")
                         if "하락" in alt or "down" in src.lower():
                             is_down = True
+
+                    # pct 파싱
+                    pct = None
                     try:
-                        pct     = float(pct_str.replace(",", "").replace("%", ""))
-                        is_down = pct < 0 if pct != 0 else is_down
+                        pct_clean = pct_str.replace(",", "").replace("%", "").strip()
+                        if pct_clean:
+                            pct     = float(pct_clean)
+                            is_down = pct < 0 if pct != 0 else is_down
                     except Exception:
-                        pct = None
+                        pass
 
                     try:
                         price = float(price_str.replace(",", ""))
                     except Exception:
                         continue
+
                     try:
                         chg = float(chg_str.replace(",", ""))
                         chg = -abs(chg) if is_down else abs(chg)
                     except Exception:
                         chg = None
 
-                    date_clean = date_str.replace(".", "").strip()
+                    # pct가 없을 때 직접 계산
+                    if pct is None and chg is not None and price and price != 0:
+                        prev_price = price - chg
+                        if prev_price != 0:
+                            pct = round(chg / prev_price * 100, 2)
+
+                    date_clean = date_str.replace(".", "").replace(" ", "").strip()
                     if len(date_clean) != 8:
                         continue
 
@@ -217,34 +260,36 @@ def fetch_hana_usd_rate() -> dict | None:
 
     soup = BeautifulSoup(res.text, "html.parser")
 
-    def _parse_split_number(tag):
+    def _parse_number(tag):
         if not tag:
             return None
-        parts = [
-            s.get_text(strip=True)
-            for s in tag.find_all("span")
-            if re.fullmatch(r"[\d.]+", s.get_text(strip=True))
-        ]
+        text = tag.get_text(strip=True).replace(",", "").replace("원", "").strip()
         try:
-            return float("".join(parts)) if parts else None
+            v = float(text)
+            return v if 900 < v < 2000 else None
         except Exception:
             return None
 
+    # 방법 1: no_today 태그
     rate = None
     no_today = soup.find("p", class_="no_today")
     if no_today:
         em = no_today.find("em")
         if em:
-            rate = _parse_split_number(em.find("em") or em)
+            rate = _parse_number(em)
 
-    if not rate or rate < 100:
-        m = re.search(r"(\d{1,4}\.\d{2})", soup.get_text())
-        if m:
-            c = float(m.group(1))
-            if 900 < c < 2000:
-                rate = c
+    # 방법 2: 정규식 fallback
+    if not rate:
+        text_all = soup.get_text()
+        matches  = re.findall(r"1[0-3]\d{2}\.\d{2}", text_all)
+        for m in matches:
+            v = float(m)
+            if 900 < v < 2000:
+                rate = v
+                break
 
-    if not rate or rate < 100:
+    # 방법 3: 모든 span 스캔
+    if not rate:
         for span in soup.find_all("span"):
             try:
                 v = float(span.get_text(strip=True).replace(",", ""))
@@ -254,19 +299,39 @@ def fetch_hana_usd_rate() -> dict | None:
             except Exception:
                 pass
 
-    if not rate or rate < 100:
-        st.warning(f"네이버 환율 파싱 실패 (rate={rate})")
+    if not rate:
+        st.warning("네이버 환율 파싱 실패")
         return None
 
+    # 전일대비 변동
     chg      = None
+    is_down  = False
     no_exday = soup.find("p", class_="no_exday")
     if no_exday:
-        chg = _parse_split_number(no_exday.find("em"))
         ico = no_exday.find("span", class_="ico")
-        if ico and "down" in ico.get("class", []):
-            chg = -abs(chg) if chg is not None else chg
+        if ico and "down" in " ".join(ico.get("class", [])):
+            is_down = True
+        em_chg = no_exday.find("em")
+        if em_chg:
+            try:
+                chg = float(em_chg.get_text(strip=True).replace(",", "").replace("원", ""))
+                chg = -abs(chg) if is_down else abs(chg)
+            except Exception:
+                pass
 
-    return {"당일Official": None, "당일Closing": rate, "전일대비": chg}
+    # 전일대비 pct 계산
+    pct = None
+    if chg is not None and rate and rate != 0:
+        prev = rate - chg
+        if prev != 0:
+            pct = round(chg / prev * 100, 2)
+
+    return {
+        "당일Official": None,
+        "당일Closing":  rate,
+        "전일대비":     chg,
+        "전일대비pct":  pct,
+    }
 
 
 # ══════════════════════════════════════════════════════════
@@ -284,7 +349,7 @@ def get_gsheet():
         spreadsheet_id       = os.environ["SPREADSHEET_ID"]
         worksheet_name       = os.environ["WORKSHEET_NAME"]
     else:
-        service_account_info = st.secrets["gcp_service_account"]
+        service_account_info = dict(st.secrets["gcp_service_account"])
         spreadsheet_id       = st.secrets["sheets"]["spreadsheet_id"]
         worksheet_name       = st.secrets["sheets"]["worksheet_name"]
 
@@ -338,6 +403,7 @@ def save_to_gsheet(price_date: str, data: dict) -> pd.DataFrame:
                 ]["품목"].tolist()
                 data = {k: v for k, v in data.items() if k not in existing_items}
                 if not data:
+                    st.info("ℹ️ 오늘 데이터가 이미 저장되어 있습니다.")
                     return df_existing
 
         new_rows = []
@@ -415,12 +481,21 @@ def calc_stats(df: pd.DataFrame) -> pd.DataFrame:
 
         latest       = sub.sort_values("날짜").iloc[-1]
         latest_price = latest.get(price_col)
-        chg_val      = latest.get("전일대비")
-        if isinstance(chg_val, float) and pd.isna(chg_val):
-            chg_val = None
+        if pd.isna(latest_price):
+            latest_price = None
 
-        basis = "LME Closing" if item in METALS else (
-            "USD/bbl" if item in OILS else "현물종가"
+        # 전일대비: 저장된 값 우선, 없으면 직전 행과 계산
+        chg_val = latest.get("전일대비")
+        if chg_val is None or (isinstance(chg_val, float) and pd.isna(chg_val)):
+            sorted_sub = sub.sort_values("날짜")[price_col].dropna()
+            if len(sorted_sub) >= 2:
+                cur  = sorted_sub.iloc[-1]
+                prev = sorted_sub.iloc[-2]
+                if prev != 0:
+                    chg_val = round((cur - prev) / prev * 100, 2)
+
+        basis = "LME Closing (USD/ton)" if item in METALS else (
+            "USD/bbl" if item in OILS else "현물종가 (KRW)"
         )
 
         results.append({
@@ -491,12 +566,12 @@ def generate_comment(stats_df: pd.DataFrame) -> str:
     fx_row = stats_df[stats_df["품목"] == "환율"]
     if not fx_row.empty:
         fx    = fx_row.iloc[0]
-        fx_s  = f"{float(fx['최신가']):,.2f}"          if pd.notna(fx['최신가'])          else "-"
-        chg_s = f"{float(fx['전일대비(%)']):+.2f}%"    if pd.notna(fx['전일대비(%)'])    else "-"
-        mom_s = f"{float(fx['전월대비변동(%)']):+.2f}%" if pd.notna(fx['전월대비변동(%)']) else "-"
+        fx_s  = f"{float(fx['최신가']):,.2f}"           if pd.notna(fx.get('최신가'))          else "-"
+        chg_s = f"{float(fx['전일대비(%)']):+.4f}"      if pd.notna(fx.get('전일대비(%)'))    else "-"
+        mom_s = f"{float(fx['전월대비변동(%)']):+.2f}%" if pd.notna(fx.get('전월대비변동(%)')) else "-"
         lines.append(
-            f"\n💱 **환율(KRW/USD):** {fx_s} "
-            f"(전일대비 {chg_s} / 전월대비 {mom_s})"
+            f"\n💱 **환율(KRW/USD):** {fx_s}원 "
+            f"(전일대비 {chg_s}원 / 전월대비 {mom_s})"
         )
 
     return "\n\n".join(lines)
@@ -534,80 +609,86 @@ with col_info:
 # ── 데이터 수집 ───────────────────────────────────────────
 if refresh:
 
-    # ① 비철금속 (e-나라지표 LME 클로징)
+    # ① 비철금속
     with st.spinner("LME 클로징 가격 수집 중 (e-나라지표)..."):
         metal_data = fetch_nonferrous_lme()
 
     if not metal_data:
         st.error("❌ 비철금속 수집 실패")
-    else:
-        price_date = list(metal_data.values())[0].get(
-            "price_date", datetime.now().strftime("%Y%m%d")
-        )
-        clean_metal = {
-            k: {fk: fv for fk, fv in v.items() if fk != "price_date"}
-            for k, v in metal_data.items()
+        st.stop()
+
+    price_date = list(metal_data.values())[0].get(
+        "price_date", datetime.now().strftime("%Y%m%d")
+    )
+    clean_metal = {
+        k: {fk: fv for fk, fv in v.items() if fk != "price_date"}
+        for k, v in metal_data.items()
+    }
+    st.success(
+        f"✅ 비철금속 {len(metal_data)}종 수신 "
+        f"(LME 기준일: {price_date[:4]}-{price_date[4:6]}-{price_date[6:]})"
+    )
+
+    with st.expander("📋 비철금속 수신 데이터 미리보기", expanded=True):
+        preview_rows = [
+            {
+                "품목":        k,
+                "당일Closing": v["당일Closing"],
+                "전일Closing": v["전일Closing"],
+                "전일대비(%)": v["전일대비"],
+            }
+            for k, v in clean_metal.items()
+        ]
+        st.table(pd.DataFrame(preview_rows))
+
+    combined = dict(clean_metal)
+
+    # ② 원유
+    with st.spinner("원유 가격 수집 중 (네이버 금융)..."):
+        oil_rows = fetch_oil_prices(pages=1)
+
+    oil_latest_by_name = {}
+    for oil_row in oil_rows:
+        name = oil_row["품목"]
+        if name not in oil_latest_by_name:
+            oil_latest_by_name[name] = oil_row
+
+    for oil_name, oil_row in oil_latest_by_name.items():
+        combined[oil_name] = {
+            "전월평균":     None,
+            "전주평균":     None,
+            "전일Official": None,
+            "전일Closing":  None,
+            "당일Official": None,
+            "당일Closing":  oil_row["당일Closing"],
+            "전일대비":     oil_row.get("전일대비pct"),  # pct 저장
         }
-        st.success(
-            f"✅ 비철금속 {len(metal_data)}종 수신 "
-            f"(LME 기준일: {price_date[:4]}-{price_date[4:6]}-{price_date[6:]})"
-        )
 
-        with st.expander("📋 수신 데이터 미리보기", expanded=True):
-            preview_rows = [
-                {
-                    "품목":        k,
-                    "당일Closing": v["당일Closing"],
-                    "전일Closing": v["전일Closing"],
-                    "전일대비(%)": v["전일대비"],
-                }
-                for k, v in clean_metal.items()
-            ]
-            st.table(pd.DataFrame(preview_rows))
+    if oil_latest_by_name:
+        st.success(f"✅ 원유 {len(oil_latest_by_name)}종 수신")
 
-        combined = dict(clean_metal)
+    # ③ 환율
+    with st.spinner("환율 수집 중 (네이버 금융)..."):
+        hana = fetch_hana_usd_rate()
 
-        # ② 원유
-        with st.spinner("원유 가격 수집 중 (네이버 금융)..."):
-            oil_rows = fetch_oil_prices(pages=1)
+    if hana:
+        combined["환율"] = {
+            "전월평균":     None,
+            "전주평균":     None,
+            "전일Official": None,
+            "전일Closing":  None,
+            "당일Official": None,
+            "당일Closing":  hana.get("당일Closing"),
+            "전일대비":     hana.get("전일대비pct"),   # pct 저장
+        }
+        st.success(f"✅ 환율 수신: {hana.get('당일Closing'):,.2f}원")
 
-        oil_latest_by_name = {}
-        for oil_row in oil_rows:
-            name = oil_row["품목"]
-            if name not in oil_latest_by_name:
-                oil_latest_by_name[name] = oil_row
+    # ④ 저장
+    with st.spinner("Google Sheets 저장 중..."):
+        save_to_gsheet(price_date, combined)
 
-        for oil_name, oil_row in oil_latest_by_name.items():
-            combined[oil_name] = {
-                "전월평균":     None,
-                "전주평균":     None,
-                "전일Official": None,
-                "전일Closing":  None,
-                "당일Official": None,
-                "당일Closing":  oil_row["당일Closing"],
-                "전일대비":     oil_row["전일대비"],
-            }
-
-        # ③ 환율
-        with st.spinner("환율 수집 중 (네이버 금융)..."):
-            hana = fetch_hana_usd_rate()
-        if hana:
-            combined["환율"] = {
-                "전월평균":     None,
-                "전주평균":     None,
-                "전일Official": None,
-                "전일Closing":  None,
-                "당일Official": None,
-                "당일Closing":  hana.get("당일Closing"),
-                "전일대비":     hana.get("전일대비"),
-            }
-
-        # ④ 저장
-        with st.spinner("Google Sheets 저장 중..."):
-            save_to_gsheet(price_date, combined)
-
-        st.success("✅ Google Sheets 저장 완료!")
-        st.cache_data.clear()
+    st.success("✅ Google Sheets 저장 완료!")
+    st.cache_data.clear()
 
 
 # ── Sheets 로드 ───────────────────────────────────────────
@@ -625,60 +706,60 @@ tab1, tab2, tab3 = st.tabs(["📌 오늘 시황", "📈 추이 차트", "📊 �
 
 
 # ════════════════════════════════
-# TAB 1
+# TAB 1 – 오늘 시황
 # ════════════════════════════════
 with tab1:
     st.markdown(generate_comment(stats_df))
     st.divider()
 
+    # 비철금속 지표
     st.subheader("💡 비철금속 LME Closing (USD/ton)")
     metal_stats = stats_df[stats_df["품목"].isin(METALS)]
-    cols = st.columns(len(METALS))
-    for i, (_, row) in enumerate(metal_stats.iterrows()):
-        price = row.get("최신가")
-        chg   = row.get("전일대비(%)")
-        try:
-            delta_str   = f"{float(chg):+.2f}%" if chg is not None and pd.notna(chg) else "-"
-            delta_color = "normal" if chg is not None and pd.notna(chg) else "off"
-        except Exception:
-            delta_str, delta_color = "-", "off"
-        cols[i].metric(
-            label=row["품목"],
-            value=f"${float(price):,.2f}" if pd.notna(price) and price is not None else "-",
-            delta=delta_str,
-            delta_color=delta_color,
-        )
+    if not metal_stats.empty:
+        cols = st.columns(len(METALS))
+        for i, (_, row) in enumerate(metal_stats.iterrows()):
+            price = row.get("최신가")
+            chg   = row.get("전일대비(%)")
+            try:
+                delta_str   = f"{float(chg):+.2f}%" if pd.notna(chg) else "-"
+                delta_color = "normal" if pd.notna(chg) else "off"
+            except Exception:
+                delta_str, delta_color = "-", "off"
+            cols[i].metric(
+                label=row["품목"],
+                value=f"${float(price):,.2f}" if pd.notna(price) else "-",
+                delta=delta_str,
+                delta_color=delta_color,
+            )
+    else:
+        st.info("비철금속 데이터가 없습니다.")
 
     st.divider()
 
+    # 원유 지표
     st.subheader("🛢️ 국제유가 (USD/bbl)")
-    oil_live = fetch_oil_latest()
-    oil_cols = st.columns(len(OILS))
+    oil_stats = stats_df[stats_df["품목"].isin(OILS)]
+    oil_cols  = st.columns(len(OILS))
     for i, oil_name in enumerate(OILS):
-        if oil_name in oil_live:
-            o       = oil_live[oil_name]
-            o_price = o.get("당일Closing")
-            o_pct   = o.get("전일대비pct")
-            o_chg   = o.get("전일대비")
+        row = oil_stats[oil_stats["품목"] == oil_name]
+        if not row.empty:
+            r       = row.iloc[0]
+            o_price = r.get("최신가")
+            o_chg   = r.get("전일대비(%)")
             try:
-                if o_pct is not None:
-                    delta_str, delta_color = f"{float(o_pct):+.2f}%", "normal"
-                elif o_chg is not None:
-                    delta_str, delta_color = f"{float(o_chg):+.2f}", "normal"
-                else:
-                    delta_str, delta_color = "-", "off"
+                delta_str   = f"{float(o_chg):+.2f}%" if pd.notna(o_chg) else "-"
+                delta_color = "normal" if pd.notna(o_chg) else "off"
             except Exception:
                 delta_str, delta_color = "-", "off"
             oil_cols[i].metric(
                 label=oil_name,
-                value=f"${float(o_price):,.2f}" if o_price else "-",
+                value=f"${float(o_price):,.2f}" if pd.notna(o_price) else "-",
                 delta=delta_str,
                 delta_color=delta_color,
             )
         else:
             oil_cols[i].metric(label=oil_name, value="-", delta="-", delta_color="off")
 
-    oil_stats = stats_df[stats_df["품목"].isin(OILS)]
     if not oil_stats.empty:
         st.markdown("**월간 비교**")
         oc1, oc2 = st.columns(2)
@@ -698,6 +779,7 @@ with tab1:
 
     st.divider()
 
+    # 전월대비 테이블
     st.subheader("📋 전월대비 분석 테이블")
     display_cols = ["품목", "최신가", "가격기준", "전일대비(%)",
                     "당월누적평균", "전월평균", "전월대비변동(%)", "기준일"]
@@ -717,24 +799,27 @@ with tab1:
 
     st.divider()
 
+    # 환율
     st.subheader("💱 환율 (KRW/USD)")
+    fx_stats = stats_df[stats_df["품목"] == "환율"]
     hana_live = fetch_hana_usd_rate()
     if hana_live:
         live_rate = hana_live.get("당일Closing")
         live_chg  = hana_live.get("전일대비")
-        fx_row    = stats_df[stats_df["품목"] == "환율"]
-        avg_this  = fx_row.iloc[0].get("당월누적평균")    if not fx_row.empty else None
-        avg_last  = fx_row.iloc[0].get("전월평균")        if not fx_row.empty else None
-        mom_chg   = fx_row.iloc[0].get("전월대비변동(%)") if not fx_row.empty else None
+        avg_this  = fx_stats.iloc[0].get("당월누적평균")    if not fx_stats.empty else None
+        avg_last  = fx_stats.iloc[0].get("전월평균")        if not fx_stats.empty else None
+        mom_chg   = fx_stats.iloc[0].get("전월대비변동(%)") if not fx_stats.empty else None
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("💱 환율 (실시간)",
-                  f"{live_rate:,.2f}" if live_rate else "-",
-                  delta=f"{live_chg:+.2f}" if live_chg else None)
+        c1.metric(
+            "💱 환율 (실시간)",
+            f"{live_rate:,.2f}원" if live_rate else "-",
+            delta=f"{live_chg:+.2f}원" if live_chg else None,
+        )
         c2.metric("당월 누적 평균",
-                  f"{float(avg_this):,.2f}" if avg_this and pd.notna(avg_this) else "-")
+                  f"{float(avg_this):,.2f}원" if avg_this and pd.notna(avg_this) else "-")
         c3.metric("전월 평균",
-                  f"{float(avg_last):,.2f}" if avg_last and pd.notna(avg_last) else "-")
+                  f"{float(avg_last):,.2f}원" if avg_last and pd.notna(avg_last) else "-")
         c4.metric("전월대비 변동",
                   f"{float(mom_chg):+.2f}%" if mom_chg and pd.notna(mom_chg) else "-")
     else:
@@ -742,7 +827,7 @@ with tab1:
 
 
 # ════════════════════════════════
-# TAB 2
+# TAB 2 – 추이 차트
 # ════════════════════════════════
 with tab2:
     st.subheader("📈 비철금속 가격 추이 (USD/ton)")
@@ -800,7 +885,7 @@ with tab2:
 
 
 # ════════════════════════════════
-# TAB 3
+# TAB 3 – 통계 분석
 # ════════════════════════════════
 with tab3:
     st.subheader("📊 월별 평균가 비교")
@@ -813,7 +898,7 @@ with tab3:
     elif item_sel in OILS:
         val_col, label = "당일Closing", "USD/bbl"
     else:
-        val_col, label = "당일Closing", "현물종가"
+        val_col, label = "당일Closing", "현물종가(KRW)"
 
     monthly = df_item.groupby("월")[val_col].mean().reset_index()
     monthly.columns = ["월", f"월평균({label})"]
