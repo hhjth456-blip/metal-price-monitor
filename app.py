@@ -63,16 +63,87 @@ def fetch_nonferrous_lme() -> dict:
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # LME시세 테이블 탐색
-        table = None
-        for t in soup.find_all("table"):
-            if t.find("td") and ("구리" in t.get_text() or "Copper" in t.get_text()):
-                table = t
-                break
+        # 헤더 th에서 날짜 파싱 (06/03 형식)
+        dates = []
+        for th in soup.find_all("th"):
+            m = re.search(r"(\d{2})/(\d{2})", th.get_text(strip=True))
+            if m:
+                year = datetime.now().strftime("%Y")
+                dates.append(f"{year}{m.group(1)}{m.group(2)}")
 
-        if not table:
-            st.warning("하이메탈: LME 테이블을 찾을 수 없습니다.")
-            return {}
+        today_date = dates[0] if dates else datetime.now().strftime("%Y%m%d")
+
+        def _parse_price(td):
+            # td 직접 텍스트에서 첫 줄 숫자만 추출 (p태그 내용 제외)
+            try:
+                # p 태그를 제거하고 순수 텍스트만
+                for p in td.find_all("p"):
+                    p.decompose()
+                raw = td.get_text(strip=True).replace(",", "")
+                return float(raw)
+            except Exception:
+                return None
+
+        def _parse_pct(td):
+            # p 태그 텍스트에서 % 추출
+            try:
+                p_tag = td.find("p")
+                if not p_tag:
+                    return None
+                raw   = p_tag.get_text(strip=True)
+                m     = re.search(r"(-?[\d.]+)%", raw)
+                if not m:
+                    return None
+                return float(m.group(1))
+            except Exception:
+                return None
+
+        result = {}
+        # class="name" td를 가진 tr만 처리
+        for tr in soup.find_all("tr"):
+            name_td  = tr.find("td", class_="name")
+            price_tds = tr.find_all("td", class_="price")
+
+            if not name_td or len(price_tds) < 2:
+                continue
+
+            # lan_Ko 클래스에서 한글 금속명 추출
+            lan_ko = name_td.find("p", class_="lan_Ko")
+            if not lan_ko:
+                continue
+            metal_name = lan_ko.get_text(strip=True)
+
+            if metal_name not in METAL_KOR:
+                continue
+
+            # price td를 복사해서 파싱 (원본 수정 방지)
+            import copy
+            td1 = copy.copy(price_tds[0])
+            td2 = copy.copy(price_tds[1])
+
+            today_pct = _parse_pct(td1)
+            today_p   = _parse_price(td1)
+            prev_p    = _parse_price(td2)
+
+            result[METAL_KOR[metal_name]] = {
+                "price_date":   today_date,
+                "전월평균":     None,
+                "전주평균":     None,
+                "전일Official": prev_p,
+                "전일Closing":  prev_p,
+                "당일Official": today_p,
+                "당일Closing":  today_p,
+                "전일대비":     today_pct,
+            }
+
+        if not result:
+            st.warning("하이메탈: 금속 데이터를 파싱하지 못했습니다.")
+        return result
+
+    except Exception as e:
+        st.error(f"하이메탈 크롤링 오류: {e}")
+        return {}
+
 
         # 헤더에서 날짜 2개 파싱 (06/03 형식)
         header_row = table.find("tr")
