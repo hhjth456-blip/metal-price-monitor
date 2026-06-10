@@ -1,9 +1,8 @@
 import streamlit as st
-import yfinance as yf
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 import re
 import time
 import gspread
@@ -22,20 +21,21 @@ st.set_page_config(
 METALS = ["알루미늄", "납", "아연", "구리", "주석", "니켈"]
 OILS   = ["WTI", "브렌트유"]
 
-# Yahoo Finance 티커 매핑
-# HG=F : 구리 COMEX (USD/lb)  → ×2204.62 = USD/ton
-# ALI=F: 알루미늄 CME (USD/ton)
-# ZN=F : 아연 CME (USD/ton)  ※ 주의: ZN=F는 10Y T-Note일 수 있음 → 별도처리
-# NI=F : 니켈 CME (USD/ton)
-# PB=F : 납 CME  (USD/ton)
-# SB=F : 주석 대용 없음 → 네이버 비철금속 크롤링으로 보완
-METAL_TICKERS = {
-    "구리":    ("HG=F",  "lb"),    # ×2204.62 → USD/ton
-    "알루미늄": ("ALI=F", "ton"),
-    "아연":    ("ZN=F",  "ton"),
-    "납":      ("PB=F",  "ton"),
-    "니켈":    ("NI=F",  "ton"),
-    "주석":    ("SN=F",  "ton"),   # SN=F 없으면 None 처리
+# 새 공공데이터포털 API (15151558 - 비철금속 일일가격, 당일 스냅샷)
+PPS_API_URL = (
+    "https://api.odcloud.kr/api/15151558/v1/"
+    "uddi:e377eebd-ce29-4807-a362-90f4a0f5c486"
+)
+
+# 컬럼 매핑: API 응답 → 내부 품목명
+# 물품분류이름: 니켈, 주석, 구리, 아연, 납, 알루미늄
+METAL_NAME_MAP = {
+    "니켈":    "니켈",
+    "주석":    "주석",
+    "구리":    "구리",
+    "아연":    "아연",
+    "납":      "납",
+    "알루미늄": "알루미늄",
 }
 
 NAVER_OIL_URLS = {
@@ -56,84 +56,89 @@ NAVER_HEADERS = {
 
 
 # ══════════════════════════════════════════════════════════
-#  yfinance 비철금속 가격 수집
+#  공공데이터포털 API - 비철금속 당일 가격 수집
 # ══════════════════════════════════════════════════════════
-def _lb_to_ton(price: float) -> float:
-    """USD/lb → USD/metric ton"""
-    return round(price * 2204.62, 2)
-
-
-@st.cache_data(ttl=3600)
-def fetch_metals_yfinance(days: int = 30) -> dict:
+def fetch_pps_api_today() -> dict | None:
     """
-    yfinance로 비철금속 선물 가격 수집
-    반환: {"YYYYMMDD": {"구리": {"당일Official": ..., "당일Closing": ...,
-                                 "전일Closing": ..., "전일대비": ...}, ...}, ...}
+    새 API (15151558) 호출 → 당일 비철금속 6종 가격 반환
+    반환: {"알루미늄": {"당일Closing": ..., "전일대비": ...}, ...}
+
+    API 응답 컬럼:
+      물품분류이름 | 물품분류번호 | 종가 | 변동폭 |
+      런던금속거래소지수 | 런던금속거래소지수변동폭
     """
-    end_dt   = datetime.today()
-    start_dt = end_dt - timedelta(days=days + 10)  # 여유 있게 다운로드
+    api_key = st.secrets["data_go_kr"]["api_key"]
 
-    result: dict[str, dict] = {}
+    try:
+        params = {
+            "page":        1,
+            "perPage":     10,
+            "returnType":  "JSON",
+            "serviceKey":  api_key,
+        }
+        res = requests.get(
+            PPS_API_URL,
+            params=params,
+            timeout=15,
+            verify=False,
+        )
+        res.raise_for_status()
+        js = res.json()
+    except Exception as e:
+        st.warning(f"공공데이터 API 오류: {e}")
+        return None
 
-    for metal, (ticker, unit) in METAL_TICKERS.items():
-        try:
-            df = yf.download(
-                ticker,
-                start=start_dt.strftime("%Y-%m-%d"),
-                end=end_dt.strftime("%Y-%m-%d"),
-                progress=False,
-                auto_adjust=True,
-            )
-            if df.empty:
-                continue
+    data = js.get("data", [])
+    if not data:
+        st.warning("API 응답 data 없음")
+        return None
 
-            # MultiIndex 정리
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
+    result = {}
 
-            df = df[["Close"]].copy()
-            df.index = pd.to_datetime(df.index).tz_localize(None)
-            df = df.sort_index()
-
-            # 단위 변환 (구리: lb → ton)
-            if unit == "lb":
-                df["Close"] = df["Close"].apply(_lb_to_ton)
-
-            df["Prev"]  = df["Close"].shift(1)
-            df["ChgPct"] = ((df["Close"] - df["Prev"]) / df["Prev"] * 100).round(2)
-
-            for ts, row in df.iterrows():
-                date_str = ts.strftime("%Y%m%d")
-                price    = row["Close"]
-                prev     = row["Prev"]
-                chg      = row["ChgPct"]
-
-                if pd.isna(price):
-                    continue
-
-                if date_str not in result:
-                    result[date_str] = {}
-
-                result[date_str][metal] = {
-                    "전월평균":     None,
-                    "전주평균":     None,
-                    "전일Official": None,
-                    "전일Closing":  None if pd.isna(prev) else round(float(prev), 2),
-                    "당일Official": round(float(price), 2),
-                    "당일Closing":  round(float(price), 2),
-                    "전일대비":     None if pd.isna(chg) else float(chg),
-                }
-
-        except Exception as e:
-            st.warning(f"yfinance {metal}({ticker}) 오류: {e}")
+    for row in data:
+        # 품목명 추출
+        item_raw = str(row.get("물품분류이름", "")).strip()
+        item     = METAL_NAME_MAP.get(item_raw)
+        if not item:
             continue
 
-    return result
+        def _f(v):
+            try:
+                return float(str(v).replace(",", ""))
+            except Exception:
+                return None
+
+        closing  = _f(row.get("종가"))
+        chg_rate = _f(row.get("변동폭"))   # 변동폭(%) 또는 변동액
+
+        result[item] = {
+            "전월평균":     None,
+            "전주평균":     None,
+            "전일Official": None,
+            "전일Closing":  None,
+            "당일Official": closing,
+            "당일Closing":  closing,
+            "전일대비":     chg_rate,
+        }
+
+    return result if result else None
 
 
-def fetch_metals_latest() -> dict:
-    """최근 5일치만 수집 (오늘 시황용)"""
-    return fetch_metals_yfinance(days=5)
+def fetch_pps_api_debug() -> dict:
+    """API 원본 응답 디버깅용 — expander에 표시"""
+    api_key = st.secrets["data_go_kr"]["api_key"]
+    try:
+        params = {
+            "page":       1,
+            "perPage":    10,
+            "returnType": "JSON",
+            "serviceKey": api_key,
+        }
+        res = requests.get(PPS_API_URL, params=params, timeout=15, verify=False)
+        res.raise_for_status()
+        return res.json()
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # ══════════════════════════════════════════════════════════
@@ -434,7 +439,7 @@ def calc_stats(df: pd.DataFrame) -> pd.DataFrame:
         if isinstance(chg_val, float) and pd.isna(chg_val):
             chg_val = None
 
-        basis = "COMEX 선물" if item in METALS else (
+        basis = "LME Cash" if item in METALS else (
             "USD/bbl" if item in OILS else "현물종가"
         )
 
@@ -506,9 +511,9 @@ def generate_comment(stats_df: pd.DataFrame) -> str:
     fx_row = stats_df[stats_df["품목"] == "환율"]
     if not fx_row.empty:
         fx    = fx_row.iloc[0]
-        fx_s  = f"{float(fx['최신가']):,.2f}"          if pd.notna(fx['최신가'])          else "-"
-        chg_s = f"{float(fx['전일대비(%)']):+.2f}%"    if pd.notna(fx['전일대비(%)'])    else "-"
-        mom_s = f"{float(fx['전월대비변동(%)']):+.2f}%" if pd.notna(fx['전월대비변동(%)']) else "-"
+        fx_s  = f"{float(fx['최신가']):,.2f}"           if pd.notna(fx['최신가'])           else "-"
+        chg_s = f"{float(fx['전일대비(%)']):+.2f}%"     if pd.notna(fx['전일대비(%)'])     else "-"
+        mom_s = f"{float(fx['전월대비변동(%)']):+.2f}%"  if pd.notna(fx['전월대비변동(%)'])  else "-"
         lines.append(
             f"\n💱 **환율(KRW/USD):** {fx_s} "
             f"(전일대비 {chg_s} / 전월대비 {mom_s})"
@@ -532,84 +537,83 @@ def color_val(val):
 # ══════════════════════════════════════════════════════════
 st.title("📊 비철금속·원유 시황 모니터")
 st.caption(
-    "비철금속: Yahoo Finance (COMEX 선물, USD/ton 환산) | "
+    "비철금속: 공공데이터포털 조달청 비철금속 일일가격 API | "
     "원유/환율: 네이버 금융 | Google Sheets 누적 저장"
 )
 
-col_btn, col_upd, col_info = st.columns([1, 1, 4])
+col_btn, col_info = st.columns([2, 4])
 with col_btn:
-    refresh = st.button("🔄 오늘 데이터 수집", use_container_width=True)
-with col_upd:
-    bulk = st.button("📥 전체 데이터 수집", use_container_width=True)
+    refresh = st.button("🔄 오늘 데이터 수집 & 저장", use_container_width=True)
 with col_info:
-    st.info(f"현재 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    st.info(
+        f"현재 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  |  "
+        "※ 이 API는 **당일 스냅샷**만 제공합니다. 매 영업일 1회 수집을 권장합니다."
+    )
+
+
+# ── API 응답 디버깅 (접어두기) ────────────────────────────
+with st.expander("🔍 API 원본 응답 확인", expanded=False):
+    if st.button("API 테스트 호출"):
+        raw = fetch_pps_api_debug()
+        st.json(raw)
 
 
 # ── 데이터 수집 ───────────────────────────────────────────
-if refresh or bulk:
-    fetch_metals_yfinance.clear()  # 캐시 초기화
+if refresh:
+    today_str = datetime.now().strftime("%Y%m%d")
 
-    days = 365 if bulk else 7
+    with st.spinner("조달청 비철금속 일일가격 API 호출 중..."):
+        metal_data = fetch_pps_api_today()
 
-    with st.spinner("Yahoo Finance에서 비철금속 선물 데이터 수집 중..."):
-        parsed = fetch_metals_yfinance(days=days)
-
-    if not parsed:
-        st.error("❌ Yahoo Finance 데이터 수집 실패. 잠시 후 다시 시도하세요.")
+    if not metal_data:
+        st.error("❌ API 수집 실패. 'API 원본 응답 확인' 버튼으로 응답을 확인하세요.")
     else:
-        st.success(f"✅ {len(parsed)}일치 비철금속 데이터 수신")
+        st.success(f"✅ 비철금속 {len(metal_data)}종 수신: {', '.join(metal_data.keys())}")
 
+        # API 응답 미리보기
+        with st.expander("📋 수신 데이터 미리보기", expanded=True):
+            preview = {k: v["당일Closing"] for k, v in metal_data.items()}
+            st.table(pd.DataFrame(
+                [{"품목": k, "종가(USD/ton)": v} for k, v in preview.items()]
+            ))
+
+        combined = dict(metal_data)
+
+        # 원유 추가
         with st.spinner("원유 가격 수집 중 (네이버 금융)..."):
-            oil_pages = 3 if bulk else 1
-            oil_rows  = fetch_oil_prices(pages=oil_pages)
+            oil_rows = fetch_oil_prices(pages=1)
+        for oil_row in oil_rows:
+            if oil_row["날짜"] == today_str:
+                oil_name = oil_row["품목"]
+                if oil_name not in combined:
+                    combined[oil_name] = {
+                        "전월평균":     None,
+                        "전주평균":     None,
+                        "전일Official": None,
+                        "전일Closing":  None,
+                        "당일Official": None,
+                        "당일Closing":  oil_row["당일Closing"],
+                        "전일대비":     oil_row["전일대비"],
+                    }
 
+        # 환율 추가
         with st.spinner("환율 수집 중 (네이버 금융)..."):
             hana = fetch_hana_usd_rate()
+        if hana:
+            combined["환율"] = {
+                "전월평균":     None,
+                "전주평균":     None,
+                "전일Official": None,
+                "전일Closing":  None,
+                "당일Official": None,
+                "당일Closing":  hana.get("당일Closing"),
+                "전일대비":     hana.get("전일대비"),
+            }
 
-        progress    = st.progress(0)
-        date_list   = sorted(parsed.keys(), reverse=True)
-        saved_count = 0
+        with st.spinner("Google Sheets 저장 중..."):
+            save_to_gsheet(today_str, combined)
 
-        for i, date_str in enumerate(date_list):
-            data = parsed[date_str]
-
-            # 원유 추가
-            for oil_row in oil_rows:
-                if oil_row["날짜"] == date_str:
-                    oil_name = oil_row["품목"]
-                    if oil_name not in data:
-                        data[oil_name] = {
-                            "전월평균":     None,
-                            "전주평균":     None,
-                            "전일Official": None,
-                            "전일Closing":  None,
-                            "당일Official": None,
-                            "당일Closing":  oil_row["당일Closing"],
-                            "전일대비":     oil_row["전일대비"],
-                        }
-
-            # 환율 추가 (최신 날짜만)
-            if i == 0 and hana and "환율" not in data:
-                data["환율"] = {
-                    "전월평균":     None,
-                    "전주평균":     None,
-                    "전일Official": None,
-                    "전일Closing":  None,
-                    "당일Official": None,
-                    "당일Closing":  hana.get("당일Closing"),
-                    "전일대비":     hana.get("전일대비"),
-                }
-
-            save_to_gsheet(date_str, data)
-            saved_count += 1
-            progress.progress(
-                (i + 1) / len(date_list),
-                text=f"저장 중... {date_str} ({i+1}/{len(date_list)})"
-            )
-            time.sleep(0.05)
-
-        progress.empty()
-        st.success(f"✅ {saved_count}일치 Google Sheets 저장 완료!")
+        st.success("✅ Google Sheets 저장 완료!")
         st.cache_data.clear()
 
 
@@ -617,7 +621,7 @@ if refresh or bulk:
 df_all = load_gsheet()
 
 if df_all.empty:
-    st.warning("⚠️ 저장된 데이터가 없습니다. 상단 버튼으로 데이터를 수집하세요!")
+    st.warning("⚠️ 저장된 데이터가 없습니다. 상단 버튼으로 오늘 데이터를 수집하세요!")
     st.stop()
 
 stats_df = calc_stats(df_all)
@@ -634,7 +638,7 @@ with tab1:
     st.markdown(generate_comment(stats_df))
     st.divider()
 
-    st.subheader("💡 비철금속 가격 (COMEX 선물, USD/ton)")
+    st.subheader("💡 비철금속 LME Cash (USD/ton)")
     metal_stats = stats_df[stats_df["품목"].isin(METALS)]
     cols = st.columns(len(METALS))
     for i, (_, row) in enumerate(metal_stats.iterrows()):
@@ -647,7 +651,7 @@ with tab1:
             delta_str, delta_color = "-", "off"
         cols[i].metric(
             label=row["품목"],
-            value=f"${float(price):,.0f}" if pd.notna(price) and price is not None else "-",
+            value=f"${float(price):,.2f}" if pd.notna(price) and price is not None else "-",
             delta=delta_str,
             delta_color=delta_color,
         )
@@ -854,6 +858,6 @@ with tab3:
 
 st.divider()
 st.caption(
-    "📌 비철금속: Yahoo Finance COMEX 선물 | 구리 USD/lb→ton 환산 포함 | "
+    "📌 LME Cash 기준 | 출처: 공공데이터포털 조달청 비철금속 일일가격 API | "
     "🛢️ 원유: 네이버 금융 | 💱 환율: 네이버 금융 | 비상업적 참고용"
 )
