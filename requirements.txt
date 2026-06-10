@@ -4,3 +4,5 @@ beautifulsoup4
 pandas
 gspread
 google-auth
+urllib3
+yfinance>=0.2.40
