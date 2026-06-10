@@ -8,6 +8,8 @@ import time
 import gspread
 from google.oauth2.service_account import Credentials
 import urllib3
+import os
+import json
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -21,22 +23,12 @@ st.set_page_config(
 METALS = ["알루미늄", "납", "아연", "구리", "주석", "니켈"]
 OILS   = ["WTI", "브렌트유"]
 
-NONFERROUS_URL = "https://www.nonferrous.or.kr/stats/?act=sub3"
-NONFERROUS_HEADERS = {
+ENARA_URL = "https://www.index.go.kr/unity/potal/main/EachDtlPageDetail.do?idx_cd=1378"
+ENARA_HEADERS = {
     "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                        "AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-    "Referer":         "https://www.nonferrous.or.kr/",
+    "Referer":         "https://www.index.go.kr/",
     "Accept-Language": "ko-KR,ko;q=0.9",
-    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
-
-NONFERROUS_COL_MAP = {
-    "Cu": "구리",
-    "Al": "알루미늄",
-    "Zn": "아연",
-    "Pb": "납",
-    "Ni": "니켈",
-    "Sn": "주석",
 }
 
 NAVER_OIL_URLS = {
@@ -57,25 +49,13 @@ NAVER_HEADERS = {
 
 
 # ══════════════════════════════════════════════════════════
-#  비철금속 LME 클로징 크롤링 (한국비철금속협회)
+#  비철금속 LME 클로징 크롤링 (e-나라지표)
 # ══════════════════════════════════════════════════════════
 def fetch_nonferrous_lme() -> dict:
-    """
-    한국비철금속협회 LME 현물 클로징 가격 수집
-    반환: {
-        "구리": {
-            "price_date": "20260609",
-            "전월평균": None, "전주평균": None,
-            "전일Official": 13661.0, "전일Closing": 13661.0,
-            "당일Official": 13716.0, "당일Closing": 13716.0,
-            "전일대비": 0.40,
-        }, ...
-    }
-    """
     try:
         resp = requests.get(
-            NONFERROUS_URL,
-            headers=NONFERROUS_HEADERS,
+            ENARA_URL,
+            headers=ENARA_HEADERS,
             timeout=15,
             verify=False,
         )
@@ -84,22 +64,13 @@ def fetch_nonferrous_lme() -> dict:
 
         table = soup.find("table")
         if not table:
-            st.warning("비철금속협회: 테이블을 찾을 수 없습니다.")
+            st.warning("e-나라지표: 테이블을 찾을 수 없습니다.")
             return {}
 
         rows = table.select("tbody tr")
         if len(rows) < 2:
-            st.warning("비철금속협회: 데이터 행이 부족합니다.")
+            st.warning("e-나라지표: 데이터 행 부족")
             return {}
-
-        # 헤더에서 컬럼 순서 파악
-        headers = []
-        for th in table.select("tr th"):
-            txt = th.get_text(strip=True)
-            if txt in NONFERROUS_COL_MAP:
-                headers.append(txt)
-        if not headers:
-            headers = ["Cu", "Al", "Zn", "Pb", "Ni", "Sn"]
 
         def _parse(v):
             try:
@@ -107,33 +78,27 @@ def fetch_nonferrous_lme() -> dict:
             except Exception:
                 return None
 
-        def _row_values(tr):
+        def _row_vals(tr):
             return [td.get_text(strip=True) for td in tr.find_all("td")]
 
-        today_vals = _row_values(rows[0])
-        prev_vals  = _row_values(rows[1])
+        today_vals = _row_vals(rows[0])
+        prev_vals  = _row_vals(rows[1])
 
-        if len(today_vals) < 7 or len(prev_vals) < 7:
-            st.warning("비철금속협회: 컬럼 수 부족")
-            return {}
+        # e-나라지표 컬럼: [날짜, 구리, 알루미늄, 아연, 납, 니켈, 주석]
+        col_map = {1: "구리", 2: "알루미늄", 3: "아연", 4: "납", 5: "니켈", 6: "주석"}
 
-        # 날짜 파싱: "2026. 06. 09" → "20260609"
-        date_raw   = today_vals[0].replace(" ", "").replace(".", "")
-        price_date = date_raw if len(date_raw) == 8 else datetime.now().strftime("%Y%m%d")
+        date_raw   = today_vals[0].replace(".", "").replace(" ", "").replace("-", "")
+        price_date = date_raw[:8] if len(date_raw) >= 8 else datetime.now().strftime("%Y%m%d")
 
         result = {}
-        for i, col in enumerate(headers):
-            metal = NONFERROUS_COL_MAP.get(col)
-            if not metal:
+        for idx, metal in col_map.items():
+            if idx >= len(today_vals):
                 continue
-
-            today_p = _parse(today_vals[i + 1])
-            prev_p  = _parse(prev_vals[i + 1])
-
-            pct = None
+            today_p = _parse(today_vals[idx])
+            prev_p  = _parse(prev_vals[idx]) if idx < len(prev_vals) else None
+            pct     = None
             if today_p and prev_p and prev_p != 0:
                 pct = round((today_p - prev_p) / prev_p * 100, 2)
-
             result[metal] = {
                 "price_date":   price_date,
                 "전월평균":     None,
@@ -144,11 +109,10 @@ def fetch_nonferrous_lme() -> dict:
                 "당일Closing":  today_p,
                 "전일대비":     pct,
             }
-
         return result
 
     except Exception as e:
-        st.error(f"비철금속협회 크롤링 오류: {e}")
+        st.error(f"e-나라지표 크롤링 오류: {e}")
         return {}
 
 
@@ -309,16 +273,11 @@ def fetch_hana_usd_rate() -> dict | None:
 #  Google Sheets
 # ══════════════════════════════════════════════════════════
 @st.cache_resource
-import os
-import json
-
 def get_gsheet():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-
-    # Fly.io 환경변수 우선, 없으면 st.secrets fallback (로컬 개발용)
     gcp_env = os.environ.get("GCP_SERVICE_ACCOUNT")
     if gcp_env:
         service_account_info = json.loads(gcp_env)
@@ -332,7 +291,6 @@ def get_gsheet():
     creds  = Credentials.from_service_account_info(service_account_info, scopes=scopes)
     client = gspread.authorize(creds)
     sheet  = client.open_by_key(spreadsheet_id)
-
     try:
         ws = sheet.worksheet(worksheet_name)
     except gspread.WorksheetNotFound:
@@ -442,7 +400,7 @@ def calc_stats(df: pd.DataFrame) -> pd.DataFrame:
         if sub.empty:
             continue
 
-        price_col = "당일Closing" if item in METALS else "당일Closing"
+        price_col = "당일Closing"
         if price_col not in sub.columns:
             continue
 
@@ -559,7 +517,7 @@ def color_val(val):
 # ══════════════════════════════════════════════════════════
 st.title("📊 비철금속·원유 시황 모니터")
 st.caption(
-    "비철금속: 한국비철금속협회 LME Closing | "
+    "비철금속: e-나라지표 LME Closing | "
     "원유/환율: 네이버 금융 | Google Sheets 누적 저장"
 )
 
@@ -576,37 +534,32 @@ with col_info:
 # ── 데이터 수집 ───────────────────────────────────────────
 if refresh:
 
-    # ① 비철금속 (한국비철금속협회 LME 클로징)
-    with st.spinner("LME 클로징 가격 수집 중 (한국비철금속협회)..."):
+    # ① 비철금속 (e-나라지표 LME 클로징)
+    with st.spinner("LME 클로징 가격 수집 중 (e-나라지표)..."):
         metal_data = fetch_nonferrous_lme()
 
     if not metal_data:
         st.error("❌ 비철금속 수집 실패")
     else:
-        # 실제 LME 가격 날짜 사용
         price_date = list(metal_data.values())[0].get(
             "price_date", datetime.now().strftime("%Y%m%d")
         )
-
-        # price_date 키 제거 후 저장용 dict 구성
         clean_metal = {
             k: {fk: fv for fk, fv in v.items() if fk != "price_date"}
             for k, v in metal_data.items()
         }
-
         st.success(
             f"✅ 비철금속 {len(metal_data)}종 수신 "
             f"(LME 기준일: {price_date[:4]}-{price_date[4:6]}-{price_date[6:]})"
         )
 
-        # 미리보기
         with st.expander("📋 수신 데이터 미리보기", expanded=True):
             preview_rows = [
                 {
-                    "품목":         k,
-                    "당일Closing":  v["당일Closing"],
-                    "전일Closing":  v["전일Closing"],
-                    "전일대비(%)":  v["전일대비"],
+                    "품목":        k,
+                    "당일Closing": v["당일Closing"],
+                    "전일Closing": v["전일Closing"],
+                    "전일대비(%)": v["전일대비"],
                 }
                 for k, v in clean_metal.items()
             ]
@@ -614,7 +567,7 @@ if refresh:
 
         combined = dict(clean_metal)
 
-        # ② 원유 (네이버 금융 — 가장 최신 행 사용)
+        # ② 원유
         with st.spinner("원유 가격 수집 중 (네이버 금융)..."):
             oil_rows = fetch_oil_prices(pages=1)
 
@@ -635,7 +588,7 @@ if refresh:
                 "전일대비":     oil_row["전일대비"],
             }
 
-        # ③ 환율 (네이버 금융)
+        # ③ 환율
         with st.spinner("환율 수집 중 (네이버 금융)..."):
             hana = fetch_hana_usd_rate()
         if hana:
@@ -649,7 +602,7 @@ if refresh:
                 "전일대비":     hana.get("전일대비"),
             }
 
-        # ④ Google Sheets 저장
+        # ④ 저장
         with st.spinner("Google Sheets 저장 중..."):
             save_to_gsheet(price_date, combined)
 
@@ -678,7 +631,6 @@ with tab1:
     st.markdown(generate_comment(stats_df))
     st.divider()
 
-    # 비철금속 메트릭
     st.subheader("💡 비철금속 LME Closing (USD/ton)")
     metal_stats = stats_df[stats_df["품목"].isin(METALS)]
     cols = st.columns(len(METALS))
@@ -699,7 +651,6 @@ with tab1:
 
     st.divider()
 
-    # 원유 메트릭
     st.subheader("🛢️ 국제유가 (USD/bbl)")
     oil_live = fetch_oil_latest()
     oil_cols = st.columns(len(OILS))
@@ -747,7 +698,6 @@ with tab1:
 
     st.divider()
 
-    # 전월대비 분석 테이블
     st.subheader("📋 전월대비 분석 테이블")
     display_cols = ["품목", "최신가", "가격기준", "전일대비(%)",
                     "당월누적평균", "전월평균", "전월대비변동(%)", "기준일"]
@@ -767,7 +717,6 @@ with tab1:
 
     st.divider()
 
-    # 환율
     st.subheader("💱 환율 (KRW/USD)")
     hana_live = fetch_hana_usd_rate()
     if hana_live:
@@ -902,6 +851,6 @@ with tab3:
 
 st.divider()
 st.caption(
-    "📌 LME Closing 기준 | 출처: 한국비철금속협회 | "
+    "📌 LME Closing 기준 | 출처: e-나라지표 | "
     "🛢️ 원유: 네이버 금융 | 💱 환율: 네이버 금융 | 비상업적 참고용"
 )
